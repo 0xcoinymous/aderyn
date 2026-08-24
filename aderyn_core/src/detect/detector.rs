@@ -154,6 +154,7 @@ define_detectors! {
     ReusedContractName,
     RTLO,
     Selfdestruct,
+    SignatureReplay,
     SignedIntegerStorageArray,
     SolmateSafeTransferLib,
     StateChangeWithoutEvent,

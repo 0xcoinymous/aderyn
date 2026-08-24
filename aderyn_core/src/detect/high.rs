@@ -37,6 +37,7 @@ pub(crate) mod unprotected_initializer;
 pub(crate) mod unsafe_casting;
 pub(crate) mod weak_randomness;
 pub(crate) mod yul_return;
+pub(crate) mod signature_replay;
 
 pub use abi_encode_packed_hash_collision::AbiEncodePackedHashCollisionDetector;
 pub use arbitrary_transfer_from::ArbitraryTransferFromDetector;
@@ -77,3 +78,4 @@ pub use unprotected_initializer::UnprotectedInitializerDetector;
 pub use unsafe_casting::UnsafeCastingDetector;
 pub use weak_randomness::WeakRandomnessDetector;
 pub use yul_return::YulReturnDetector;
+pub use signature_replay::SignatureReplayDetector;
