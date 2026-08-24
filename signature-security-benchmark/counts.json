@@ -1,0 +1,30 @@
+{
+  "dataset": "signature-security-benchmark",
+  "target_cases": 408,
+  "solidity_files": 410,
+  "families": {
+    "SR": 204,
+    "SM": 204
+  },
+  "signature_malleability": {
+    "target_cases": 204,
+    "labels": {
+      "vulnerable": 120,
+      "safe": 84
+    },
+    "classes": {
+      "1_high_s_noncanonical_acceptance": 30,
+      "2_permissive_incorrect_v_handling": 30,
+      "3_multiple_noncanonical_representations": 30,
+      "4_raw_signature_uniqueness_key": 30,
+      "safe_canonical_raw_recovery": 20,
+      "safe_library_canonical_recovery": 20,
+      "safe_flexible_representation": 20,
+      "safe_message_based_uniqueness": 12,
+      "adversarial_safe_control": 12
+    },
+    "support_files": [
+      "contracts/SM_MalleabilityBenchLib.sol"
+    ]
+  }
+}
