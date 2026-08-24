@@ -143,6 +143,7 @@ define_detectors! {
     MultipleConstructors,
     MultiplePlaceholders,
     NestedStructInMapping,
+    NonceManagement,
     NonReentrantNotFirst,
     OutOfOrderRetryable,
     PreDeclaredLocalVariableUsage,

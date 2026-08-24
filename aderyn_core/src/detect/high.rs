@@ -40,6 +40,8 @@ pub(crate) mod yul_return;
 pub(crate) mod signature_replay;
 pub(crate) mod signature_malleability;
 pub(crate) mod signature_utils;
+pub(crate) mod nonce_management;
+
 
 pub use abi_encode_packed_hash_collision::AbiEncodePackedHashCollisionDetector;
 pub use arbitrary_transfer_from::ArbitraryTransferFromDetector;
@@ -82,3 +84,4 @@ pub use weak_randomness::WeakRandomnessDetector;
 pub use yul_return::YulReturnDetector;
 pub use signature_replay::SignatureReplayDetector;
 pub use signature_malleability::SignatureMalleabilityDetector;
+pub use nonce_management::NonceManagementDetector;
