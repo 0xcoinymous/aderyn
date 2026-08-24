@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.29;
+import "./NM_NonceBenchLib.sol";
+
+contract NM_OrderFillNonceNamespace05 is NM_NonceSignerBase {
+    
+    mapping(address => uint256) public recipientAllowance;
+    mapping(address => uint256) public nonces; mapping(address => uint256) public relayerNonces; mapping(address => uint256) public identityNonces; mapping(address => mapping(bytes32 => uint256)) public operationNonces; mapping(address => mapping(address => mapping(address => uint256))) public approvalNonces;
+
+    
+
+    
+
+    function fillOrder(address signer, address cosigner, address identity, bytes32 accountHash, address recipient, address token, address spender, address alternateSigner, uint256 amount, bytes32 actionId, bytes32 operationType, bytes32 alternateOperationType, uint256 nonce, uint8 v, bytes32 r, bytes32 s) external  {
+        require(nonce == identityNonces[identity], "wrong nonce");
+        bytes32 digest = keccak256(abi.encode(accountHash, recipient, amount, actionId, nonce));
+        require(_recover(digest, v, r, s) == signer, "invalid signature");
+        identityNonces[identity] = nonce + 1;
+        recipientAllowance[recipient] = amount;
+    }
+}

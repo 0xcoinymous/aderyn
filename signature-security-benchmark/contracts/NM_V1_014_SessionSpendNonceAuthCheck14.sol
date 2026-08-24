@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.29;
+import "./NM_NonceBenchLib.sol";
+
+contract NM_SessionSpendNonceAuthCheck14 {
+    uint256 public successful; bytes32 public lastAction; mapping(address=>uint256) public nonces;
+
+    
+
+    function spendBySig(address signer,address recipient,uint256 amount,bytes32 actionId,uint256 nonce,uint256 expectedNonce,bool legacy,uint8 v,bytes32 r,bytes32 s) external {
+        require(nonce % 16 == nonces[signer] % 16,"wrong nonce bucket"); bytes32 digest=keccak256(abi.encode(signer,recipient,amount,actionId,nonce));
+        require(NM_NonceBenchLib.recoverChecked(digest, v, r, s) == signer, "invalid signature");
+        nonces[signer]=nonce+1; successful += 1; lastAction = actionId;
+    }
+}
