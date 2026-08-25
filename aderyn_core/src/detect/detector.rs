@@ -119,6 +119,7 @@ define_detectors! {
     DynamicArrayLengthAssignment,
     Ecrecover,
     EIP712Implementation,
+    EIP1271Verification,
     EmptyBlock,
     EmptyRequireRevert,
     EnumerableLoopRemoval,
