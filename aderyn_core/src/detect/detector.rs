@@ -157,6 +157,7 @@ define_detectors! {
     ReusedContractName,
     RTLO,
     Selfdestruct,
+    SignatureFreshness,
     SignatureMalleability,
     SignatureReplay,
     SignedIntegerStorageArray,

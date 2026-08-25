@@ -20,7 +20,7 @@ contract SF_KeeperReportSafeMonotonicRoundHelper017 {
         return verifier.verify(signer_, digest, signature);
     }
 
-    function execute(address keeper, uint256 upkeepId, uint64 round, bytes32 reportHash, uint64 round, bytes calldata signature) external payable {
+    function execute(address keeper, uint256 upkeepId, uint64 round, bytes32 reportHash, bytes calldata signature) external payable {
         address signer_ = keeper;
         require(reportHash != bytes32(0), "report");
         uint256 nonce = nonces[signer_];
