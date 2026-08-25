@@ -41,6 +41,7 @@ pub(crate) mod signature_replay;
 pub(crate) mod signature_malleability;
 pub(crate) mod signature_utils;
 pub(crate) mod nonce_management;
+pub(crate) mod eip712_implementation;
 
 
 pub use abi_encode_packed_hash_collision::AbiEncodePackedHashCollisionDetector;
@@ -85,3 +86,4 @@ pub use yul_return::YulReturnDetector;
 pub use signature_replay::SignatureReplayDetector;
 pub use signature_malleability::SignatureMalleabilityDetector;
 pub use nonce_management::NonceManagementDetector;
+pub use eip712_implementation::EIP712ImplementationDetector;

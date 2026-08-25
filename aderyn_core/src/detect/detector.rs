@@ -118,6 +118,7 @@ define_detectors! {
     DivisionBeforeMultiplication,
     DynamicArrayLengthAssignment,
     Ecrecover,
+    EIP712Implementation,
     EmptyBlock,
     EmptyRequireRevert,
     EnumerableLoopRemoval,
