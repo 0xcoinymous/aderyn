@@ -300,8 +300,13 @@ fn analyze_freshness(
             has_authenticated_effective_staleness_limit = true;
         }
 
-        // A runtime freshness predicate that the signer did not authenticate is attacker-adjustable.
-        if !authenticated && candidate_is_checked(candidate, &predicates) {
+        // A runtime freshness predicate that the signer did not authenticate is attacker-adjustable,
+        // but only when the caller supplies it. Constants and storage bounds such as `MAX_AGE`
+        // are fixed by the contract, not by the attacker.
+        if !authenticated
+            && candidate_is_caller_controlled(candidate, model)
+            && candidate_is_checked(candidate, &predicates)
+        {
             if meaningful || enforcement.shape_only || candidate.semantic.is_staleness_limiting() {
                 has_unauthenticated_freshness_check = true;
             }
@@ -776,6 +781,12 @@ fn candidate_is_authenticated(
     let expanded = expand_expression(&candidate.expr, &model.assignments, 8);
     let deps = identifiers_in_text(&expanded);
     !deps.is_disjoint(&auth.authenticated_names)
+}
+
+fn candidate_is_caller_controlled(candidate: &FreshnessCandidate, model: &FunctionModel) -> bool {
+    let expanded = expand_expression(&candidate.expr, &model.assignments, 8);
+    let deps = identifiers_in_text(&expanded);
+    model.sig.params.iter().any(|p| deps.contains(&p.name)) || expanded.contains("msg.data")
 }
 
 fn candidate_is_checked(candidate: &FreshnessCandidate, predicates: &[String]) -> bool {
