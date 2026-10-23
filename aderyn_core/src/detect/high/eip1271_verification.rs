@@ -470,7 +470,7 @@ fn collect_strong_input_use(
     };
 
     let mut result = InputUse::default();
-    for call in scan_call_expressions(&model.source) {
+    for call in scan_call_expressions(body_of(model)) {
         if !is_strong_verification_call(&call.name) {
             continue;
         }
@@ -502,6 +502,12 @@ fn collect_strong_input_use(
             if expr_depends_on_aliases(arg, signature_aliases, &model.assignments, 7) {
                 callee_signature_aliases.insert(param.name.clone());
             }
+        }
+        // Inputs handed to a helper that itself performs the recovery count as used, even when the
+        // helper splits the signature with inline assembly (as OpenZeppelin's ECDSA does).
+        if source_has_strong_verification_call(body_of(callee)) {
+            result.hash |= !callee_hash_aliases.is_empty();
+            result.signature |= !callee_signature_aliases.is_empty();
         }
         let mut branch_visited = visited.clone();
         result.merge(collect_strong_input_use(
@@ -541,7 +547,12 @@ fn implementation_magic_semantics_bad(
         let Some(model) = models.get(&id) else {
             continue;
         };
-        if !source_has_strong_verification_call(&model.source) {
+        if !source_has_strong_verification_call(body_of(model)) {
+            continue;
+        }
+        // Only functions that produce the ERC-1271 result can get the magic value wrong; recovery
+        // helpers returning an address or bool are judged through their bytes4-returning caller.
+        if id != root && !model.sig.returns.iter().any(|ty| normalize_type(ty) == "bytes4") {
             continue;
         }
         if local_magic_semantics_bad(model) {
@@ -624,13 +635,19 @@ fn condition_depends_on_verifier(condition: &str, vars: &BTreeSet<String>) -> bo
 
 fn condition_true_means_success(condition: &str) -> bool {
     let c = compact(condition);
-    if c.starts_with('!') {
-        return false;
+    // `recovered != address(0) && recovered == owner` is a success condition: a zero-address guard
+    // inside a conjunction does not invert it.
+    let conjuncts: Vec<&str> = c
+        .split("&&")
+        .filter(|part| {
+            let p = part.trim_start_matches('(').trim_end_matches(')');
+            !(p.ends_with("!=address(0)") || p.ends_with("!=address(0x0)"))
+        })
+        .collect();
+    if conjuncts.is_empty() {
+        return true;
     }
-    if c.contains("!=") {
-        return false;
-    }
-    true
+    !conjuncts.iter().any(|part| part.starts_with('!') || part.contains("!="))
 }
 
 fn implementation_uses_attacker_controlled_identity(
@@ -713,7 +730,7 @@ fn implementation_has_permissive_zero_owner_fallback(
             continue;
         };
         let compacted = compact(&model.source);
-        if !compacted.contains("address(0)") || !source_has_strong_verification_call(&model.source) {
+        if !compacted.contains("address(0)") || !source_has_strong_verification_call(body_of(model)) {
             continue;
         }
         // High-confidence form: a zero policy/owner branch accepts any nonzero recovered address.
@@ -744,7 +761,7 @@ fn implementation_has_explicit_raw_hash_passthrough(
         if model.source.contains("address(this)") || model.source.contains("block.chainid") {
             has_domain_binding = true;
         }
-        if scan_call_expressions(&model.source)
+        if scan_call_expressions(body_of(model))
             .iter()
             .any(|call| matches!(call.name.as_str(), "recover" | "tryRecover" | "ecrecover"))
         {
@@ -888,17 +905,30 @@ fn caller_direct_magic_validation_bad(model: &FunctionModel) -> bool {
 }
 
 fn direct_call_result_variable(source: &str, call: &ParsedCall) -> Option<String> {
-    let needle = format!(".isValidSignature({})", call.args.join(","));
-    let compact_source = compact(source);
-    let compact_needle = compact(&needle);
-    let pos = compact_source.find(&compact_needle)?;
-    let stmt_start = compact_source[..pos].rfind(';').map(|p| p + 1).unwrap_or(0);
-    let prefix = &compact_source[stmt_start..pos];
-    let eq = prefix.rfind('=')?;
-    if eq > 0 && matches!(prefix.as_bytes().get(eq - 1).copied(), Some(b'=' | b'!' | b'<' | b'>')) {
-        return None;
+    // Work on the original text: `compact` drops whitespace, which would turn
+    // `bytes4 result = ...` into the identifier `bytes4result`.
+    let wanted_args = compact(&call.args.join(","));
+    let needle = ".isValidSignature(";
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(needle) {
+        let pos = from + rel;
+        let open = pos + needle.len() - 1;
+        from = open + 1;
+        let Some(close) = matching_delimiter(source, open, '(', ')') else {
+            continue;
+        };
+        if compact(&source[open + 1..close]) != wanted_args {
+            continue;
+        }
+        let stmt_start = source[..pos].rfind([';', '{', '}']).map(|p| p + 1).unwrap_or(0);
+        let prefix = &source[stmt_start..pos];
+        let eq = prefix.rfind('=')?;
+        if eq > 0 && matches!(prefix.as_bytes().get(eq - 1).copied(), Some(b'=' | b'!' | b'<' | b'>')) {
+            return None;
+        }
+        return last_identifier(&prefix[..eq]);
     }
-    last_identifier(&prefix[..eq])
+    None
 }
 
 fn has_exact_magic_comparison_for_var(source: &str, var: &str) -> bool {
@@ -1544,7 +1574,7 @@ fn collect_probable_local_names(model: &FunctionModel) -> BTreeSet<String> {
         .filter(|p| !p.name.is_empty())
         .map(|p| p.name.clone())
         .collect();
-    for statement in split_statements(&model.source) {
+    for statement in split_statements(body_of(model)) {
         if !looks_like_variable_declaration(&statement) {
             continue;
         }
@@ -1708,6 +1738,13 @@ fn function_body(source: &str) -> Option<&str> {
     let open = source.find('{')?;
     let close = matching_delimiter(source, open, '{', '}')?;
     Some(&source[open + 1..close])
+}
+
+/// The function body without its header. Scanning the full source would treat the declaration
+/// `isValidSignature(bytes32 hash, bytes calldata signature)` as a call that uses both inputs,
+/// and would merge the header into the first statement.
+fn body_of(model: &FunctionModel) -> &str {
+    function_body(&model.source).unwrap_or(&model.source)
 }
 
 fn parse_call_args_at(source: &str, pos: usize) -> Option<Vec<String>> {
@@ -2173,7 +2210,7 @@ mod eip1271_verification_tests {
 }
 
 #[cfg(test)]
-mod eip1271_verification_tests {
+mod eip1271_verification_model_tests {
     use super::*;
 
     fn model(id: NodeID, scope: NodeID, source: &str) -> FunctionModel {
