@@ -503,10 +503,11 @@ fn collect_strong_input_use(
                 callee_signature_aliases.insert(param.name.clone());
             }
         }
-        // Inputs handed to a helper that itself performs the recovery count as used, even when the
-        // helper splits the signature with inline assembly (as OpenZeppelin's ECDSA does).
+        // A signature handed to a helper that itself performs the recovery counts as used, even when
+        // the helper splits it with inline assembly (as OpenZeppelin's ECDSA does). The hash gets no
+        // such shortcut: it must reach the recovery call, or a helper that verifies a fixed digest
+        // instead of the supplied hash would go unnoticed.
         if source_has_strong_verification_call(body_of(callee)) {
-            result.hash |= !callee_hash_aliases.is_empty();
             result.signature |= !callee_signature_aliases.is_empty();
         }
         let mut branch_visited = visited.clone();
