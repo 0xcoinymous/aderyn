@@ -1391,7 +1391,21 @@ fn expression_double_hashes_role(expression: &str, model: &FunctionModel, role: 
     if name != "keccak256" || args.len() != 1 {
         return false;
     }
-    expression_role(&args[0], model) == role
+    expression_is_hash_of_role(&args[0], model, role)
+}
+
+/// True when `expression` is already a finished hash of `role` (a domain separator or struct hash),
+/// so hashing it again is a double hash. `abi.encode(TYPEHASH, ...)` is the preimage of a struct
+/// hash, not a hash, and must not count; otherwise every inlined `structHash` looks double-hashed.
+fn expression_is_hash_of_role(expression: &str, model: &FunctionModel, role: TypedRole) -> bool {
+    let stripped = strip_outer_parentheses(expression.trim());
+    match root_call(stripped) {
+        Some((name, args)) if name == "abi.encode" || name == "abi.encodePacked" => {
+            args.len() == 1 && expression_is_hash_of_role(&args[0], model, role)
+        }
+        Some((name, _)) if name == "keccak256" => expression_role(stripped, model) == role,
+        _ => expression_role(stripped, model) == role,
+    }
 }
 
 fn resolve_function_name(
