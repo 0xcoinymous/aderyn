@@ -98,15 +98,21 @@ impl IssueDetector for SignatureMalleabilityDetector {
                 &summaries,
             );
 
+            // Malleability is exploitable only when the serialized signature (or a hash of it) acts as
+            // the authorization identity: a second encoding of the same signature then looks like a new
+            // authorization (SWC-117; OpenZeppelin ECDSA guidance). When replay protection is derived
+            // from the message (nonce, digest, authorization id), the alternative encoding names the
+            // same, already consumed authorization, so classes 1 and 2 are reported only with identity.
+
             // Class 1: high-s / non-canonical s accepted on a signature-authenticated path.
-            if summary.unsafe_high_s {
+            if summary.unsafe_high_s && signature_identity {
                 vulnerable.insert(model.id);
                 continue;
             }
 
             // Class 2: lossy/permissive v normalization accepts multiple representations or maps
             // invalid values onto a valid recovery parity.
-            if summary.permissive_v {
+            if summary.permissive_v && signature_identity {
                 vulnerable.insert(model.id);
                 continue;
             }
@@ -304,6 +310,17 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
         let local_pos = node_span.start.saturating_sub(function_span.start);
         let args = parse_call_args_at(source, local_pos).unwrap_or_default();
 
+        // The AST records the exact target of a library or internal member call; use it when it is
+        // an implemented function, and fall back to name lookup only otherwise.
+        if let Some(callee) = member.referenced_declaration.filter(|id| {
+            *id != caller
+                && function_ids.contains(id)
+                && source_by_id.get(id).is_some_and(|callee_source| callee_source.contains('{'))
+        }) {
+            push_call_unique(&mut calls_by_function, caller, CallSite { callee, args: args.clone() });
+            continue;
+        }
+
         // Resolve member calls without depending on a version-sensitive MemberAccess accessor.
         // Prefer a same-source-file function with the member name (typical external verifier/mock),
         // then fall back to a globally unique function name (typical imported library helper).
@@ -488,6 +505,16 @@ fn has_effective_low_s_guard(
     candidates.extend(identifiers_in_text(s_expression));
     if candidates.is_empty() {
         return false;
+    }
+    // Forward aliases: a local that is just `s` or a cast of it, e.g. `uint256 su = uint256(s)`.
+    let originals: Vec<String> = candidates.iter().cloned().collect();
+    for (lhs, rhs) in assignments {
+        let rhs = compact(rhs);
+        if originals.iter().any(|symbol| {
+            rhs == *symbol || rhs == format!("uint256({symbol})") || rhs == format!("uint({symbol})")
+        }) {
+            candidates.insert(lhs.clone());
+        }
     }
 
     for statement in split_statements(source_before_sink) {
@@ -1141,6 +1168,45 @@ mod tests {
             }
         "#;
         assert!(!indexed_security_use_of_key(source, "observation"));
+    }
+
+    fn run(path: &str) -> usize {
+        let context = crate::detect::test_utils::load_solidity_source_unit(path);
+        let mut detector = SignatureMalleabilityDetector::default();
+        detector.detect(&context).unwrap();
+        detector.instances().len()
+    }
+
+    #[test]
+    fn detects_high_s_with_signature_identity() {
+        assert_eq!(
+            run("../tests/contract-playground/src/signature-malleability/MalleabilityHighSIdentity.sol"),
+            1
+        );
+    }
+
+    #[test]
+    fn accepts_raw_recovery_with_message_nonce() {
+        assert_eq!(
+            run("../tests/contract-playground/src/signature-malleability/MalleabilityNonceProtectedSafe.sol"),
+            0
+        );
+    }
+
+    #[test]
+    fn accepts_low_s_check_through_alias() {
+        assert_eq!(
+            run("../tests/contract-playground/src/signature-malleability/MalleabilityAliasLowSSafe.sol"),
+            0
+        );
+    }
+
+    #[test]
+    fn detects_permissive_v_with_signature_identity() {
+        assert_eq!(
+            run("../tests/contract-playground/src/signature-malleability/MalleabilityPermissiveVIdentity.sol"),
+            1
+        );
     }
 
     #[test]
