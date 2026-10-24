@@ -948,27 +948,49 @@ fn classify_typed_digest(
         if args.len() != 1 {
             return DigestStatus::Incorrect;
         }
-        let inner = strip_outer_parentheses(args[0].trim());
+        let resolved_inner = resolve_simple_alias(args[0].trim(), &model.assignments, 5);
+        let inner = strip_outer_parentheses(resolved_inner.trim());
         let Some((encoder, pieces)) = root_call(inner) else {
             return DigestStatus::Incorrect;
         };
         if encoder == "abi.encode" {
             return DigestStatus::Incorrect;
         }
-        if encoder != "abi.encodePacked" {
-            return DigestStatus::Incorrect;
+        if encoder != "abi.encodePacked" && encoder != "bytes.concat" {
+            // `keccak256(encodeTransactionData(...))`: an internal helper builds the encoded bytes;
+            // classify the bytes it returns. An unresolved encoder is unknown, not wrong.
+            if let Some(callee) =
+                resolve_function_name(model, &encoder, models).and_then(|id| models.get(&id))
+            {
+                if let Some(ret) = first_return_expression(&callee.source) {
+                    let substitutions = parameter_substitutions(&callee.parameters, &pieces);
+                    let instantiated = substitute_identifiers(&ret, &substitutions);
+                    return classify_typed_digest(
+                        &format!("keccak256({instantiated})"),
+                        model,
+                        models,
+                        depth - 1,
+                    );
+                }
+            }
+            return DigestStatus::Unknown;
         }
-        if pieces.len() != 3 || !is_canonical_1901_prefix(&pieces[0], model) {
+        // The prefix may be one literal ("\x19\x01") or two bytes (bytes1(0x19), bytes1(0x01)).
+        let parts: Vec<String> = if pieces.len() == 4 && is_split_1901_prefix(&pieces[0], &pieces[1]) {
+            pieces[2..].to_vec()
+        } else if pieces.len() == 3 && is_canonical_1901_prefix(&pieces[0], model) {
+            pieces[1..].to_vec()
+        } else {
             return DigestStatus::Incorrect;
-        }
+        };
 
-        let second_role = expression_role(&pieces[1], model);
-        let third_role = expression_role(&pieces[2], model);
+        let second_role = expression_role(&parts[0], model);
+        let third_role = expression_role(&parts[1], model);
         if second_role == TypedRole::Struct && third_role == TypedRole::Domain {
             return DigestStatus::Incorrect;
         }
-        if expression_double_hashes_role(&pieces[1], model, TypedRole::Domain)
-            || expression_double_hashes_role(&pieces[2], model, TypedRole::Struct)
+        if expression_double_hashes_role(&parts[0], model, TypedRole::Domain)
+            || expression_double_hashes_role(&parts[1], model, TypedRole::Struct)
         {
             return DigestStatus::Incorrect;
         }
@@ -1349,6 +1371,18 @@ fn is_canonical_1901_prefix(expression: &str, model: &FunctionModel) -> bool {
         || c == "0x1901"
         || c == "bytes2(0x1901)"
         || c == "bytes2(hex\"1901\")"
+}
+
+fn is_split_1901_prefix(first: &str, second: &str) -> bool {
+    let first = compact(first).to_ascii_lowercase();
+    let second = compact(second).to_ascii_lowercase();
+    matches!(
+        first.as_str(),
+        "bytes1(0x19)" | "byte(0x19)" | "0x19" | "\"\\x19\"" | "bytes1(\"\\x19\")"
+    ) && matches!(
+        second.as_str(),
+        "bytes1(0x01)" | "byte(0x01)" | "0x01" | "\"\\x01\"" | "bytes1(\"\\x01\")" | "bytes1(0x1)"
+    )
 }
 
 fn expression_role(expression: &str, model: &FunctionModel) -> TypedRole {
@@ -2267,6 +2301,14 @@ mod eip712_implementation_tests {
     fn accepts_signed_runtime_target() {
         assert_eq!(
             run("../tests/contract-playground/src/eip712-implementation/SignedTarget.sol"),
+            0
+        );
+    }
+
+    #[test]
+    fn accepts_helper_encoded_digest_with_split_prefix() {
+        assert_eq!(
+            run("../tests/contract-playground/src/eip712-implementation/HelperEncodedSplitPrefix.sol"),
             0
         );
     }
