@@ -1991,7 +1991,8 @@ fn extract_first_state_slot(
             i += 1;
         }
         let base = &expression[start..i];
-        if is_language_identifier(base) {
+        // Skip the tail of a number literal (`x7fff…` in `0x7fff…`) and language identifiers.
+        if is_language_identifier(base) || (start > 0 && bytes[start - 1].is_ascii_digit()) {
             continue;
         }
         let mut cursor = i;
@@ -2021,6 +2022,16 @@ fn extract_first_state_slot(
                 }
                 field = Some(expression[field_start..cursor].to_string());
             }
+        }
+
+        // `Lib.recoverChecked(...)` or `token.balanceOf(...)` is a call, not a storage slot.
+        let mut after_field = cursor;
+        while after_field < bytes.len() && bytes[after_field].is_ascii_whitespace() {
+            after_field += 1;
+        }
+        if field.is_some() && after_field < bytes.len() && bytes[after_field] == b'(' {
+            i = cursor;
+            continue;
         }
 
         if !keys.is_empty() || field.is_some() {
@@ -2477,6 +2488,14 @@ mod nonce_management_tests {
     fn accepts_implicit_nonce_consumption() {
         assert_eq!(
             run("../tests/contract-playground/src/nonce-management/NonceImplicitConsumptionSafe.sol"),
+            0
+        );
+    }
+
+    #[test]
+    fn accepts_library_recovery_with_literal_bound() {
+        assert_eq!(
+            run("../tests/contract-playground/src/nonce-management/NonceLibraryRecoverSafe.sol"),
             0
         );
     }

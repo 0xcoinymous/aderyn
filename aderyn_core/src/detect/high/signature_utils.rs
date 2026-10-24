@@ -473,6 +473,10 @@ pub(crate) fn identifier_sequence(text: &str) -> Vec<String> {
             while i < bytes.len() && is_ident_continue(bytes[i]) {
                 i += 1;
             }
+            // The tail of a number literal (`x7fff…` in `0x7fff…`, `e18` in `1e18`) is not an identifier.
+            if start > 0 && bytes[start - 1].is_ascii_digit() {
+                continue;
+            }
             out.push(text[start..i].to_string());
         } else {
             i += 1;
