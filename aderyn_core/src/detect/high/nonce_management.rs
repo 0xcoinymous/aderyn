@@ -13,8 +13,8 @@ use crate::{
 use super::signature_utils::{
     collect_assignments, compact, contains_word, expand_expression, find_top_level_operator,
     function_name, identifier_sequence, identifiers_in_text, is_public_or_external,
-    matching_delimiter, parse_call_args_at, split_statements, split_top_level,
-    substitute_identifiers, SrcSpan,
+    matching_delimiter, operand_before, parse_call_args_at, returned_expressions,
+    split_statements, split_top_level, substitute_identifiers, SrcSpan,
 };
 
 /// Detects application-level authorization nonce defects on signature-gated Solidity paths.
@@ -341,6 +341,27 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
         };
         let local_pos = node_span.start.saturating_sub(function_span.start);
         let args = parse_call_args_at(source, local_pos).unwrap_or_default();
+
+        // The AST records the exact target of a library or internal member call; use it when it is
+        // an implemented function, and fall back to name lookup only otherwise.
+        if let Some(callee) = member.referenced_declaration.filter(|id| {
+            *id != caller
+                && function_ids.contains(id)
+                && source_by_id.get(id).is_some_and(|callee_source| callee_source.contains('{'))
+        }) {
+            push_call_unique(
+                &mut calls_by_function,
+                caller,
+                CallSite {
+                    callee,
+                    name: member.member_name.clone(),
+                    args: args.clone(),
+                    pos: local_pos,
+                    principal_after_call: principal_after_call(source, local_pos),
+                },
+            );
+            continue;
+        }
 
         let same_file_key = (node_span.file, member.member_name.clone());
         if let Some(ids) = functions_by_file_and_name.get(&same_file_key) {
@@ -687,6 +708,7 @@ fn assess_entry_function(
     models: &BTreeMap<NodeID, FunctionModel>,
     helper_summaries: &BTreeMap<NodeID, StateHelperSummary>,
 ) -> NonceAssessment {
+    let auth = &with_digest_helper_returns(model, auth, models);
     let locals = collect_local_names(&model.source, &model.parameters);
     let mut guards = collect_guards(
         model,
@@ -754,6 +776,23 @@ fn assess_entry_function(
         }
     }
 
+    // A counter whose current value is in the signed digest and that is advanced unconditionally
+    // (e.g. `nonces[owner]++` inside `abi.encode`, or `_useNonce(owner)`) is consumed even without
+    // an explicit guard: a signature over the old value cannot verify again.
+    let mut bound_slots: Vec<StateSlot> = Vec::new();
+    for write in &writes {
+        if write_is_digest_bound_counter(write, &writes, auth, &model.assignments)
+            && !bound_slots.iter().any(|slot| slot.same_storage_location(&write.slot))
+        {
+            bound_slots.push(write.slot.clone());
+        }
+    }
+    if !bound_slots.is_empty() {
+        effective += bound_slots.len();
+        candidate_activity = true;
+        guarded_slots.extend(bound_slots);
+    }
+
     if !candidate_activity {
         candidate_activity = writes.iter().any(|write| {
             write_looks_like_nonce_activity(write, auth, &model.assignments)
@@ -817,6 +856,67 @@ fn assess_entry_function(
     }
 }
 
+
+/// Adds the state returned by helpers that are called inside the signed digest (e.g. `_useNonce(owner)`
+/// in `abi.encode`) to the authenticated roots.
+fn with_digest_helper_returns(
+    model: &FunctionModel,
+    auth: &AuthSummary,
+    models: &BTreeMap<NodeID, FunctionModel>,
+) -> AuthSummary {
+    let mut out = auth.clone();
+    for call in &model.calls {
+        if !auth.authenticated_roots.contains(&call.name) {
+            continue;
+        }
+        let Some(callee) = models.get(&call.callee) else {
+            continue;
+        };
+        let substitutions = parameter_substitutions(callee, call);
+        for expression in returned_expressions(&callee.source) {
+            let expanded = expand_expression(&expression, &callee.assignments, 4);
+            let mapped = substitute_identifiers(&expanded, &substitutions);
+            out.authenticated_roots.extend(identifiers_in_text(&mapped));
+        }
+    }
+    out
+}
+
+fn write_is_digest_bound_counter(
+    write: &WriteFact,
+    writes: &[WriteFact],
+    auth: &AuthSummary,
+    assignments: &HashMap<String, String>,
+) -> bool {
+    if write.conditional || !counter_write_advances(write, assignments) {
+        return false;
+    }
+    let base_signed = auth.authenticated_roots.contains(&write.slot.base)
+        || write
+            .slot
+            .field
+            .as_ref()
+            .is_some_and(|field| auth.authenticated_roots.contains(field));
+    base_signed
+        && slot_keys_authenticated(&write.slot, auth, assignments)
+        && writes
+            .iter()
+            .rev()
+            .find(|other| other.slot.same_storage_location(&write.slot))
+            .is_some_and(|last| counter_write_advances(last, assignments))
+}
+
+fn counter_write_advances(write: &WriteFact, assignments: &HashMap<String, String>) -> bool {
+    match write.kind {
+        WriteKind::Increment => true,
+        WriteKind::AddAssign => !expression_is_zero(&write.rhs),
+        WriteKind::Assign => {
+            let rhs = compact(&expand_expression(&write.rhs, assignments, 4));
+            rhs.contains(&write.slot.base) && rhs.contains('+') && !rhs.contains('-')
+        }
+        _ => false,
+    }
+}
 
 fn is_narrow_integer_parameter(parameter: &Parameter) -> bool {
     let raw = compact(&parameter.raw);
@@ -1134,6 +1234,24 @@ fn collect_writes_from_statement(
             }
             from = index + needle.len();
         }
+    }
+
+    // `counter.increment()` on an OpenZeppelin counter, possibly through a local storage pointer
+    // (`Counters.Counter storage nonce = _nonces[owner]; nonce.increment();`).
+    let mut from = 0usize;
+    while let Some(index) = statement[from..].find(".increment()").map(|x| from + x) {
+        let operand = operand_before(statement, index);
+        let target = assignments.get(&operand).cloned().unwrap_or(operand);
+        if let Some(slot) = extract_first_state_slot(&target, assignments, parameters, locals) {
+            out.push(WriteFact {
+                slot,
+                kind: WriteKind::Increment,
+                rhs: String::new(),
+                pos: pos + index,
+                conditional,
+            });
+        }
+        from = index + ".increment()".len();
     }
 
     // Plain '=' is handled last. Skip comparisons and compound assignments.
@@ -2352,6 +2470,22 @@ mod nonce_management_tests {
         assert_eq!(
             run("../tests/contract-playground/src/nonce-management/BitmapNonceSafe.sol"),
             0
+        );
+    }
+
+    #[test]
+    fn accepts_implicit_nonce_consumption() {
+        assert_eq!(
+            run("../tests/contract-playground/src/nonce-management/NonceImplicitConsumptionSafe.sol"),
+            0
+        );
+    }
+
+    #[test]
+    fn detects_reset_of_implicitly_consumed_nonce() {
+        assert_eq!(
+            run("../tests/contract-playground/src/nonce-management/NonceImplicitReset.sol"),
+            1
         );
     }
 }
