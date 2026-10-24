@@ -8,7 +8,7 @@ contract SignatureReplayNoProtection {
     constructor(address signer_) { signer = signer_; }
 
     function claim(address account, uint256 amount, uint8 v, bytes32 r, bytes32 s) external {
-        bytes32 digest = keccak256(abi.encode(account, amount));
+        bytes32 digest = keccak256(abi.encode(account, amount, address(this), block.chainid));
         require(ecrecover(digest, v, r, s) == signer, "bad sig");
         paid[account] += amount;
     }

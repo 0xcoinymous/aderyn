@@ -10,7 +10,7 @@ contract SignatureReplayInterproceduralSafe {
 
     function execute(bytes32 authorizationId, uint8 v, bytes32 r, bytes32 s) external {
         require(!_isUsed(authorizationId), "used");
-        bytes32 digest = keccak256(abi.encode(authorizationId));
+        bytes32 digest = keccak256(abi.encode(authorizationId, address(this), block.chainid));
         require(_valid(digest, v, r, s), "bad sig");
         _consume(authorizationId);
         executions++;

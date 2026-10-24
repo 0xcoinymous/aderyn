@@ -10,7 +10,7 @@ contract SignatureReplayCheckedNotConsumed {
 
     function execute(bytes32 authorizationId, uint8 v, bytes32 r, bytes32 s) external {
         require(!used[authorizationId], "used");
-        bytes32 digest = keccak256(abi.encode(authorizationId));
+        bytes32 digest = keccak256(abi.encode(authorizationId, address(this), block.chainid));
         require(ecrecover(digest, v, r, s) == signer, "bad sig");
         executions++;
     }

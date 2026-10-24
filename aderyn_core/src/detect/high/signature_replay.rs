@@ -11,6 +11,8 @@ use crate::{
 };
 use eyre::Result;
 
+use super::signature_utils::{function_name, operand_after, operand_before, returned_expressions};
+
 /// Detects signature-authorized operations whose one-time authorization state is absent,
 /// ineffective, rolled back, or scoped more narrowly than the authenticated authorization.
 ///
@@ -215,9 +217,11 @@ impl IssueDetector for SignatureReplayDetector {
                 })
                 .collect();
 
+            let bound = digest_bound_counters(&facts, &model.assignments);
+
             // Class 1: a signed state-changing operation has no effective authenticated one-time
             // invariant. View-only/check-only signature functions are intentionally ignored.
-            if facts.sensitive_effect && effective.is_empty() {
+            if facts.sensitive_effect && effective.is_empty() && bound.is_empty() {
                 vulnerable.insert(model.id);
                 analyses.insert(model.id, facts);
                 continue;
@@ -225,11 +229,10 @@ impl IssueDetector for SignatureReplayDetector {
 
             // Class 3: the authorization is consumed, but a later external execution path can revert
             // the whole transaction. The old authorization is then restored together with all state.
+            let external_pos = first_external_effect_position(&model.source).unwrap_or(0);
             if facts.reverting_external_flow
-                && effective.iter().any(|(_, write)| {
-                    let external_pos = first_external_effect_position(&model.source).unwrap_or(0);
-                    write.pos <= external_pos
-                })
+                && (effective.iter().any(|(_, write)| write.pos <= external_pos)
+                    || bound.iter().any(|write| write.pos <= external_pos))
             {
                 vulnerable.insert(model.id);
                 analyses.insert(model.id, facts);
@@ -255,6 +258,13 @@ impl IssueDetector for SignatureReplayDetector {
                 vulnerable.insert(model.id);
                 analyses.insert(model.id, facts);
                 continue;
+            }
+
+            // Class 4, domain form: the signed digest is bound neither to this contract nor to the
+            // chain (no `address(this)`, chain id or EIP-712 domain), so the same signature is valid
+            // on every deployment and every chain that shares the signer.
+            if facts.sensitive_effect && !model.direct_auth_roots.is_empty() && !digest_is_domain_bound(model, &models) {
+                vulnerable.insert(model.id);
             }
 
             analyses.insert(model.id, facts);
@@ -290,8 +300,8 @@ impl IssueDetector for SignatureReplayDetector {
                     continue;
                 }
 
-                let a_slots = effective_slots(a_facts);
-                let b_slots = effective_slots(b_facts);
+                let a_slots = effective_slots(a_facts, &a.assignments);
+                let b_slots = effective_slots(b_facts, &b.assignments);
                 if a_slots.is_empty() || b_slots.is_empty() {
                     continue;
                 }
@@ -443,7 +453,8 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
         let params = parse_parameter_names(&source);
         let assignments = collect_assignments(&source);
         let guards = collect_guards(&source, &params);
-        let writes = collect_writes(&source);
+        let mut writes = collect_writes(&source);
+        resolve_storage_aliases(&mut writes, &assignments);
         let returned_slot = collect_returned_slot(&source);
         let entry_point = is_public_or_external(&source);
         let direct_signature_sink = direct_sink_ids.contains(&function.id);
@@ -630,6 +641,16 @@ fn inline_helper_facts(
         facts.sensitive_effect |= callee.sensitive_effect;
         facts.reverting_external_flow |= callee.reverting_external_flow;
 
+        // A helper whose result is part of the signed digest (e.g. `_useNonce(owner)` inside
+        // `abi.encode`) contributes the state it returns to the authenticated values.
+        if function_name(&callee.source).is_some_and(|name| facts.auth_symbols.contains(&name)) {
+            for expression in returned_expressions(&callee.source) {
+                let expanded = expand_expression(&expression, &callee.assignments, 4);
+                let mapped = substitute_identifiers(&expanded, &substitutions);
+                facts.auth_symbols.extend(identifiers_in_text(&mapped));
+            }
+        }
+
         if gated.contains(&callee.id) {
             let callee_symbols = resolve_auth_symbols(callee, &callee.direct_auth_roots);
             for symbol in callee_symbols {
@@ -731,12 +752,55 @@ fn write_invalidates_guard(guard: &GuardFact, write: &WriteFact) -> bool {
     }
 }
 
+/// Storage counters whose current value is part of the signed digest and that the function advances
+/// unconditionally, e.g. `abi.encode(..., nonces[owner]++)`, `_useNonce(owner)` or `nonce++` after
+/// encoding `nonce`. A signature over the old value cannot verify again, so such a counter is an
+/// effective one-time invariant even without an explicit guard.
+fn digest_bound_counters<'a>(
+    facts: &'a AnalysisFacts,
+    assignments: &HashMap<String, String>,
+) -> Vec<&'a WriteFact> {
+    facts
+        .writes
+        .iter()
+        .filter(|write| {
+            !write.conditional
+                && facts.auth_symbols.contains(&write.slot.base)
+                && write
+                    .slot
+                    .dependencies()
+                    .iter()
+                    .all(|dep| facts.auth_symbols.contains(dep))
+                && write_advances_counter(write, assignments)
+                && final_write_for_slot(&facts.writes, &write.slot)
+                    .is_some_and(|last| write_advances_counter(last, assignments))
+        })
+        .collect()
+}
+
+fn write_advances_counter(write: &WriteFact, assignments: &HashMap<String, String>) -> bool {
+    match write.op {
+        WriteOp::Increment => true,
+        WriteOp::AddAssign => !is_zeroish(&compact(&write.rhs)),
+        WriteOp::Assign => {
+            let rhs = compact(&expand_expression(&write.rhs, assignments, 4));
+            let slot = compact_slot(&write.slot);
+            !rhs.contains('-')
+                && (rhs.contains(&format!("{slot}+"))
+                    || rhs.contains(&format!("+{slot}"))
+                    || rhs.contains(&format!("({slot})+"))
+                    || rhs.contains(&format!("+({slot})")))
+        }
+        _ => false,
+    }
+}
+
 fn final_write_for_slot<'a>(writes: &'a [WriteFact], slot: &Slot) -> Option<&'a WriteFact> {
     writes.iter().rev().find(|write| same_slot(slot, &write.slot))
 }
 
-fn effective_slots(facts: &AnalysisFacts) -> BTreeSet<Slot> {
-    facts
+fn effective_slots(facts: &AnalysisFacts, assignments: &HashMap<String, String>) -> BTreeSet<Slot> {
+    let mut slots: BTreeSet<Slot> = facts
         .guards
         .iter()
         .filter(|g| guard_is_authenticated(g, &facts.auth_symbols))
@@ -745,7 +809,59 @@ fn effective_slots(facts: &AnalysisFacts) -> BTreeSet<Slot> {
                 .is_some_and(|w| write_invalidates_guard(g, w))
         })
         .map(|g| g.slot.clone())
-        .collect()
+        .collect();
+    slots.extend(
+        digest_bound_counters(facts, assignments)
+            .into_iter()
+            .map(|w| w.slot.clone()),
+    );
+    slots
+}
+
+/// Whether the signed digest of an entry point commits to the execution domain: the contract address, the
+/// chain id, or an EIP-712 domain separator / typed-data helper. Helpers that build the digest are
+/// followed two levels deep.
+fn digest_is_domain_bound(model: &FunctionModel, models: &BTreeMap<NodeID, FunctionModel>) -> bool {
+    let mut text: String = model
+        .direct_auth_roots
+        .iter()
+        .map(|root| expand_expression(root, &model.assignments, 8))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut frontier = vec![model];
+    for _ in 0..2 {
+        let mut next = Vec::new();
+        for function in frontier {
+            for call in &function.calls {
+                let Some(callee) = models.get(&call.callee) else {
+                    continue;
+                };
+                let Some(name) = function_name(&callee.source) else {
+                    continue;
+                };
+                if contains_word(&text, &name) {
+                    text.push(' ');
+                    text.push_str(&callee.source);
+                    next.push(callee);
+                }
+            }
+        }
+        frontier = next;
+    }
+    let lower = compact(&text).to_ascii_lowercase();
+    [
+        "address(this)",
+        "chainid",
+        "domainseparator",
+        "domain_separator",
+        "_hashtypeddata",
+        "totypeddatahash",
+        "eip712domain",
+        "\\x19\\x01",
+        "1901",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn expand_expression(expr: &str, assignments: &HashMap<String, String>, depth: usize) -> String {
@@ -953,9 +1069,28 @@ fn collect_writes(source: &str) -> Vec<WriteFact> {
             }
         }
 
-        if let Some(idx) = s.find("++") {
-            if let Some(slot) = parse_lvalue(s[..idx].trim()) {
-                let pos = statement_pos + statement.rfind(&slot.base).unwrap_or(0);
+        // `x++` / `++x` anywhere in the statement, including inside an expression such as
+        // `abi.encode(..., nonces[owner]++)`, and `counter.increment()` on an OpenZeppelin counter.
+        let mut increments = Vec::new();
+        let mut from = 0;
+        while let Some(rel) = s[from..].find("++") {
+            let idx = from + rel;
+            let mut operand = operand_before(s, idx);
+            if operand.is_empty() {
+                operand = operand_after(s, idx + 2);
+            }
+            increments.push(operand);
+            from = idx + 2;
+        }
+        let mut from = 0;
+        while let Some(rel) = s[from..].find(".increment()") {
+            let idx = from + rel;
+            increments.push(operand_before(s, idx));
+            from = idx + ".increment()".len();
+        }
+        for operand in increments {
+            if let Some(slot) = parse_lvalue(&operand) {
+                let pos = statement_pos + statement.find(&operand).unwrap_or(0);
                 out.push(WriteFact {
                     slot,
                     op: WriteOp::Increment,
@@ -967,6 +1102,21 @@ fn collect_writes(source: &str) -> Vec<WriteFact> {
         }
     }
     out
+}
+
+/// A write through a local storage pointer, e.g. `Counters.Counter storage nonce = _nonces[owner];
+/// nonce.increment();`, is a write to the slot the pointer refers to.
+fn resolve_storage_aliases(writes: &mut [WriteFact], assignments: &HashMap<String, String>) {
+    for write in writes {
+        if !write.slot.keys.is_empty() {
+            continue;
+        }
+        if let Some(target) = assignments.get(&write.slot.base).and_then(|rhs| parse_slot(rhs)) {
+            if !target.keys.is_empty() {
+                write.slot = target;
+            }
+        }
+    }
 }
 
 fn collect_returned_slot(source: &str) -> Option<Slot> {
@@ -1033,7 +1183,13 @@ fn parse_slot(text: &str) -> Option<Slot> {
 
 fn digest_argument_at(source: &str, pos: usize, sink_name: &str) -> Option<String> {
     let args = parse_call_args_at(source, pos)?;
-    let index = if sink_name == "isValidSignatureNow" && args.len() >= 3 { 1 } else { 0 };
+    // `isValidSignatureNow(signer, hash, sig)` and external verifiers `isValid(signer, digest, sig)`
+    // take the digest second; recover/tryRecover/isValidSignature take it first.
+    let index = if matches!(sink_name, "isValidSignatureNow" | "isValid") && args.len() >= 3 {
+        1
+    } else {
+        0
+    };
     args.get(index).cloned()
 }
 
@@ -1553,6 +1709,38 @@ mod signature_replay_tests {
         assert!(
             run("../tests/contract-playground/src/signature-replay/SignatureReplayCrossFunction.sol")
                 >= 1
+        );
+    }
+
+    #[test]
+    fn accepts_implicit_nonce_consumption() {
+        assert_eq!(
+            run("../tests/contract-playground/src/signature-replay/SignatureReplayImplicitNonceSafe.sol"),
+            0
+        );
+    }
+
+    #[test]
+    fn detects_encoded_but_unadvanced_nonce() {
+        assert_eq!(
+            run("../tests/contract-playground/src/signature-replay/SignatureReplayImplicitNonceMissing.sol"),
+            2
+        );
+    }
+
+    #[test]
+    fn detects_digest_without_domain_binding() {
+        assert_eq!(
+            run("../tests/contract-playground/src/signature-replay/SignatureReplayCrossDomain.sol"),
+            1
+        );
+    }
+
+    #[test]
+    fn accepts_external_verifier_with_consumed_nonce() {
+        assert_eq!(
+            run("../tests/contract-playground/src/signature-replay/SignatureReplayExternalVerifierSafe.sol"),
+            0
         );
     }
 }

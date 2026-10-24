@@ -11,7 +11,7 @@ contract SignatureReplayCrossFunction {
 
     function primary(bytes32 id, uint8 v, bytes32 r, bytes32 s) external {
         require(!usedPrimary[id], "used");
-        bytes32 digest = keccak256(abi.encode(id));
+        bytes32 digest = keccak256(abi.encode(id, address(this), block.chainid));
         require(ecrecover(digest, v, r, s) == signer, "bad sig");
         usedPrimary[id] = true;
         executions++;
@@ -19,7 +19,7 @@ contract SignatureReplayCrossFunction {
 
     function alternate(bytes32 id, uint8 v, bytes32 r, bytes32 s) external {
         require(!usedAlternate[id], "used");
-        bytes32 digest = keccak256(abi.encode(id));
+        bytes32 digest = keccak256(abi.encode(id, address(this), block.chainid));
         require(ecrecover(digest, v, r, s) == signer, "bad sig");
         usedAlternate[id] = true;
         executions++;

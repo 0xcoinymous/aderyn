@@ -10,7 +10,7 @@ contract SignatureReplayNonceSafe {
 
     function claim(address account, uint256 amount, uint256 nonce, uint8 v, bytes32 r, bytes32 s) external {
         require(nonce == nonces[account], "bad nonce");
-        bytes32 digest = keccak256(abi.encode(account, amount, nonce));
+        bytes32 digest = keccak256(abi.encode(account, amount, nonce, address(this), block.chainid));
         require(ecrecover(digest, v, r, s) == signer, "bad sig");
         nonces[account] = nonce + 1;
         paid[account] += amount;

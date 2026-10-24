@@ -107,6 +107,119 @@ pub(crate) fn function_name(source: &str) -> Option<String> {
     first_identifier(after)
 }
 
+/// Names of the named return variables, e.g. `current` in `returns (uint256 current)`.
+pub(crate) fn named_return_variables(source: &str) -> Vec<String> {
+    let header = source.split('{').next().unwrap_or(source);
+    let Some(returns_pos) = find_word_from(header, "returns", 0) else {
+        return Vec::new();
+    };
+    let Some(open_rel) = header[returns_pos..].find('(') else {
+        return Vec::new();
+    };
+    let open = returns_pos + open_rel;
+    let Some(close) = matching_delimiter(header, open, '(', ')') else {
+        return Vec::new();
+    };
+    split_top_level(&header[open + 1..close], ',')
+        .into_iter()
+        .filter_map(|part| {
+            let identifiers = identifier_sequence(&part);
+            if identifiers.len() < 2 {
+                return None;
+            }
+            identifiers
+                .into_iter()
+                .rev()
+                .find(|x| !is_type_or_location_keyword(x))
+        })
+        .collect()
+}
+
+/// Expressions a function returns: the operands of its `return` statements and the values assigned to
+/// its named return variables.
+pub(crate) fn returned_expressions(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for statement in split_statements(source) {
+        if let Some(pos) = find_word_from(&statement, "return", 0) {
+            let expression = statement[pos + "return".len()..].trim().trim_end_matches(';').trim();
+            if !expression.is_empty() {
+                out.push(expression.to_string());
+            }
+        }
+    }
+    let assignments = collect_assignments(source);
+    for name in named_return_variables(source) {
+        if let Some(rhs) = assignments.get(&name) {
+            out.push(rhs.clone());
+        }
+    }
+    out
+}
+
+/// The operand that ends just before byte `end`, e.g. `nonces[owner]` in `nonces[owner]++` or
+/// `self.nonce` in `self.nonce.increment()`. Empty when there is none.
+pub(crate) fn operand_before(text: &str, end: usize) -> String {
+    let bytes = text.as_bytes();
+    let mut i = end.min(bytes.len());
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    let stop = i;
+    while i > 0 {
+        let ch = bytes[i - 1];
+        if ch == b']' {
+            let mut depth = 0i32;
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                match bytes[j] {
+                    b']' => depth += 1,
+                    b'[' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if depth != 0 {
+                break;
+            }
+            i = j;
+        } else if is_ident_continue(ch) || ch == b'.' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    text[i..stop].trim_start_matches('.').to_string()
+}
+
+/// The operand that starts at byte `start`, e.g. `nonce` in `++nonce`. Empty when there is none.
+pub(crate) fn operand_after(text: &str, start: usize) -> String {
+    let bytes = text.as_bytes();
+    let mut i = start.min(bytes.len());
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let begin = i;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'[' {
+            match matching_delimiter(text, i, '[', ']') {
+                Some(close) => i = close + 1,
+                None => break,
+            }
+        } else if is_ident_continue(ch) || ch == b'.' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    text[begin..i].to_string()
+}
+
 pub(crate) fn is_public_or_external(source: &str) -> bool {
     let header = source.split('{').next().unwrap_or(source);
     contains_word(header, "public") || contains_word(header, "external")
