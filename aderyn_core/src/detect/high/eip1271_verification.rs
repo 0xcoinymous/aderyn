@@ -811,11 +811,11 @@ fn caller_low_level_validation_bad(model: &FunctionModel) -> bool {
             // A successful STATICCALL is not equivalent to a valid ERC-1271 signature.
             return true;
         };
-        if let Some((hash_param, signature_param)) = hash_and_signature_parameter_names(&model.sig) {
+        if let Some((hash_params, signature_params)) = forwardable_parameter_names(&model.sig) {
             if fact.hash_expr.as_deref().is_some_and(|expr| {
-                !expr_depends_on_name(expr, &hash_param, &model.assignments, 7)
+                !depends_on_any(expr, &hash_params, &model.assignments)
             }) || fact.signature_expr.as_deref().is_some_and(|expr| {
-                !expr_depends_on_name(expr, &signature_param, &model.assignments, 7)
+                !depends_on_any(expr, &signature_params, &model.assignments)
             }) {
                 // A correct low-level call is still unsafe if a wrapper replaces the caller's
                 // hash/signature with a fixed or unrelated value.
@@ -847,20 +847,46 @@ fn caller_low_level_validation_bad(model: &FunctionModel) -> bool {
 }
 
 fn caller_direct_input_forwarding_bad(model: &FunctionModel) -> bool {
-    let Some((hash_param, signature_param)) = hash_and_signature_parameter_names(&model.sig) else {
+    let Some((hash_params, signature_params)) = forwardable_parameter_names(&model.sig) else {
         return false;
     };
     for call in collect_direct_is_valid_signature_calls(&model.source) {
         if call.args.len() < 2 {
             continue;
         }
-        if !expr_depends_on_name(&call.args[0], &hash_param, &model.assignments, 7)
-            || !expr_depends_on_name(&call.args[1], &signature_param, &model.assignments, 7)
+        if !depends_on_any(&call.args[0], &hash_params, &model.assignments)
+            || !depends_on_any(&call.args[1], &signature_params, &model.assignments)
         {
             return true;
         }
     }
     false
+}
+
+/// Parameters a wrapper may legitimately forward as the hash (any `bytes32`, or any `bytes` for the
+/// legacy interface that takes the signed data) and as the signature (any `bytes`).
+fn forwardable_parameter_names(sig: &FunctionSignature) -> Option<(Vec<String>, Vec<String>)> {
+    let named = |ty: &str| -> Vec<String> {
+        sig.params
+            .iter()
+            .filter(|p| normalize_type(&p.ty) == ty && !p.name.is_empty())
+            .map(|p| p.name.clone())
+            .collect()
+    };
+    let bytes32 = named("bytes32");
+    let bytes = named("bytes");
+    if bytes32.is_empty() || bytes.is_empty() {
+        return None;
+    }
+    let mut hash = bytes32;
+    hash.extend(bytes.iter().cloned());
+    Some((hash, bytes))
+}
+
+fn depends_on_any(expr: &str, names: &[String], assignments: &HashMap<String, String>) -> bool {
+    names
+        .iter()
+        .any(|name| expr_depends_on_name(expr, name, assignments, 7))
 }
 
 
@@ -1285,12 +1311,44 @@ fn failed_call_path_accepts_magic(source: &str, success: &str) -> bool {
     tail.contains("return") && source_has_magic(tail) && tail.matches("return").count() >= 2
 }
 
+/// An equality whose operand is the magic value itself: the constant, a constant named as the magic
+/// value, or the `isValidSignature` selector. Any other `==` in the function (e.g. a length check)
+/// does not count.
 fn has_exact_magic_equality(source: &str) -> bool {
     let c = compact(source).to_ascii_lowercase();
-    c.contains("==0x1626ba7e")
-        || c.contains("0x1626ba7e==")
-        || (c.contains("==") && c.contains("isvalidsignature.selector"))
-        || (c.contains("==") && contains_magic_identifier(source))
+    let mut from = 0usize;
+    while let Some(rel) = c[from..].find("==") {
+        let index = from + rel;
+        if magic_operand(last_operand(&c[..index])) || magic_operand(first_operand(&c[index + 2..])) {
+            return true;
+        }
+        from = index + 2;
+    }
+    false
+}
+
+fn first_operand(text: &str) -> &str {
+    let end = text
+        .find(|ch: char| matches!(ch, ';' | ',' | '&' | '|' | '?' | ')' | '{' | '}'))
+        .unwrap_or(text.len());
+    &text[..end]
+}
+
+fn last_operand(text: &str) -> &str {
+    let start = text
+        .rfind(|ch: char| matches!(ch, ';' | ',' | '&' | '|' | '?' | '(' | '{' | '}' | '='))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    &text[start..]
+}
+
+fn magic_operand(operand: &str) -> bool {
+    let operand = operand.trim_matches(|ch: char| ch == '(' || ch == ')');
+    operand.contains(ERC1271_MAGIC)
+        || operand.ends_with("isvalidsignature.selector")
+        || identifier_sequence(operand)
+            .iter()
+            .any(|id| id.to_ascii_lowercase().contains("magic"))
 }
 
 fn source_has_magic(source: &str) -> bool {
@@ -2134,6 +2192,22 @@ mod eip1271_verification_tests {
         assert_eq!(
             run("../tests/contract-playground/src/eip1271-verification/NonzeroMagic.sol"),
             1
+        );
+    }
+
+    #[test]
+    fn detects_nonzero_magic_acceptance_next_to_a_length_check() {
+        assert_eq!(
+            run("../tests/contract-playground/src/eip1271-verification/NonzeroMagicWithLengthCheck.sol"),
+            1
+        );
+    }
+
+    #[test]
+    fn accepts_legacy_interface_caller_forwarding_data() {
+        assert_eq!(
+            run("../tests/contract-playground/src/eip1271-verification/LegacyInterfaceCallerSafe.sol"),
+            0
         );
     }
 
