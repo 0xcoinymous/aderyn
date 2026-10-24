@@ -11,7 +11,9 @@ use crate::{
 };
 use eyre::Result;
 
-use super::signature_utils::{function_name, operand_after, operand_before, returned_expressions};
+use super::signature_utils::{
+    MAX_EXPANSION_LEN, function_name, operand_after, operand_before, returned_expressions,
+};
 
 /// Detects signature-authorized operations whose one-time authorization state is absent,
 /// ineffective, rolled back, or scoped more narrowly than the authenticated authorization.
@@ -865,13 +867,32 @@ fn digest_is_domain_bound(model: &FunctionModel, models: &BTreeMap<NodeID, Funct
 }
 
 fn expand_expression(expr: &str, assignments: &HashMap<String, String>, depth: usize) -> String {
+    expand_memoized(expr, assignments, depth, &mut HashMap::new())
+}
+
+/// Each (variable, remaining depth) pair is expanded once per call; an expansion longer than
+/// `MAX_EXPANSION_LEN` leaves the variable as it is.
+fn expand_memoized(
+    expr: &str,
+    assignments: &HashMap<String, String>,
+    depth: usize,
+    memo: &mut HashMap<(String, usize), Option<String>>,
+) -> String {
     if depth == 0 {
         return expr.to_string();
     }
     let mut substitutions = HashMap::new();
     for ident in identifiers_in_text(expr) {
         if let Some(rhs) = assignments.get(&ident) {
-            substitutions.insert(ident, format!("({})", expand_expression(rhs, assignments, depth - 1)));
+            let key = (ident.clone(), depth);
+            if !memo.contains_key(&key) {
+                let inner = expand_memoized(rhs, assignments, depth - 1, memo);
+                let replacement = (inner.len() <= MAX_EXPANSION_LEN).then(|| format!("({inner})"));
+                memo.insert(key.clone(), replacement);
+            }
+            if let Some(replacement) = &memo[&key] {
+                substitutions.insert(ident, replacement.clone());
+            }
         }
     }
     if substitutions.is_empty() {

@@ -251,10 +251,25 @@ pub(crate) fn collect_assignments(source: &str) -> HashMap<String, String> {
     out
 }
 
+/// Longest expansion of one variable that is substituted; a longer one leaves the variable as it is.
+/// Chains of assignments that use the previous variable several times grow exponentially otherwise.
+pub(crate) const MAX_EXPANSION_LEN: usize = 1 << 18;
+
 pub(crate) fn expand_expression(
     expression: &str,
     assignments: &HashMap<String, String>,
     depth: usize,
+) -> String {
+    expand_memoized(expression, assignments, depth, &mut HashMap::new())
+}
+
+/// The expansion of a variable depends only on the variable and the remaining depth, so each pair is
+/// expanded once per call.
+fn expand_memoized(
+    expression: &str,
+    assignments: &HashMap<String, String>,
+    depth: usize,
+    memo: &mut HashMap<(String, usize), Option<String>>,
 ) -> String {
     if depth == 0 {
         return expression.to_string();
@@ -263,10 +278,15 @@ pub(crate) fn expand_expression(
     for identifier in identifiers_in_text(expression) {
         if let Some(rhs) = assignments.get(&identifier) {
             if compact(rhs) != compact(&identifier) {
-                substitutions.insert(
-                    identifier,
-                    format!("({})", expand_expression(rhs, assignments, depth - 1)),
-                );
+                let key = (identifier.clone(), depth);
+                if !memo.contains_key(&key) {
+                    let inner = expand_memoized(rhs, assignments, depth - 1, memo);
+                    let replacement = (inner.len() <= MAX_EXPANSION_LEN).then(|| format!("({inner})"));
+                    memo.insert(key.clone(), replacement);
+                }
+                if let Some(replacement) = &memo[&key] {
+                    substitutions.insert(identifier, replacement.clone());
+                }
             }
         }
     }

@@ -1358,7 +1358,7 @@ fn expand_expression(expr: &str, assignments: &HashMap<String, String>, depth: u
             break;
         }
         let next = substitute_identifiers(&current, &substitutions);
-        if next == current {
+        if next == current || next.len() > super::signature_utils::MAX_EXPANSION_LEN {
             break;
         }
         current = next;
