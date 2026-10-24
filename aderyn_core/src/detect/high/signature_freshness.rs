@@ -1744,9 +1744,11 @@ fn canonical_expr(source: &str) -> String {
 }
 
 fn contains_block_timestamp(source: &str) -> bool {
+    // `now` is the pre-0.7 alias of `block.timestamp`.
     canonical_expr(source)
         .to_ascii_lowercase()
         .contains("block.timestamp")
+        || contains_word(source, "now")
 }
 
 fn contains_block_number(source: &str) -> bool {
@@ -1810,6 +1812,19 @@ mod tests {
         models.insert(1, m.clone());
         let auth = direct_auth_summary(&m);
         analyze_freshness(&m, &models, &auth)
+    }
+
+    #[test]
+    fn accepts_signed_deadline_enforced_with_now() {
+        let source = r#"
+            function permit(address owner, address spender, uint256 value, uint256 deadline, bytes calldata signature) external {
+                bytes32 digest = keccak256(abi.encode(owner, spender, value, deadline));
+                require(ECDSA.recover(digest, signature) == owner, "sig");
+                require(now <= deadline, "expired");
+                allowance[owner][spender] = value;
+            }
+        "#;
+        assert_eq!(analyze_single(source), None);
     }
 
     #[test]
