@@ -98,21 +98,21 @@ impl IssueDetector for SignatureMalleabilityDetector {
                 &summaries,
             );
 
-            // Malleability is exploitable only when the serialized signature (or a hash of it) acts as
-            // the authorization identity: a second encoding of the same signature then looks like a new
-            // authorization (SWC-117; OpenZeppelin ECDSA guidance). When replay protection is derived
-            // from the message (nonce, digest, authorization id), the alternative encoding names the
-            // same, already consumed authorization, so classes 1 and 2 are reported only with identity.
+            // Accepting a non-canonical signature is reported as a weakness on every
+            // signature-authenticated path, whether or not it is exploitable. It is exploitable when the
+            // serialized signature (or a hash of it) acts as the authorization identity (SWC-117); with
+            // message-derived replay protection the second form names the same authorization, but the
+            // contract still accepts signatures that canonical verifiers reject.
 
             // Class 1: high-s / non-canonical s accepted on a signature-authenticated path.
-            if summary.unsafe_high_s && signature_identity {
+            if summary.unsafe_high_s {
                 vulnerable.insert(model.id);
                 continue;
             }
 
             // Class 2: lossy/permissive v normalization accepts multiple representations or maps
             // invalid values onto a valid recovery parity.
-            if summary.permissive_v && signature_identity {
+            if summary.permissive_v {
                 vulnerable.insert(model.id);
                 continue;
             }
@@ -202,7 +202,8 @@ impl IssueDetector for SignatureMalleabilityDetector {
         String::from(
             "A signature-authenticated operation accepts a non-canonical ECDSA signature, performs \
              permissive recovery-parity normalization, or treats a non-canonical serialized \
-             signature as the authorization/replay identity. ECDSA can admit equivalent \
+             signature as the authorization/replay identity. Non-canonical acceptance is reported \
+             even when replay protection makes it unexploitable. ECDSA can admit equivalent \
              representations unless the implementation enforces a lower-half-order s value and a \
              single intended recovery-parity convention. When multiple encodings such as compact \
              and traditional signatures are accepted, replay/uniqueness state must be keyed by the \
@@ -1186,10 +1187,18 @@ mod tests {
     }
 
     #[test]
-    fn accepts_raw_recovery_with_message_nonce() {
+    fn reports_high_s_even_with_message_nonce() {
         assert_eq!(
             run("../tests/contract-playground/src/signature-malleability/MalleabilityNonceProtectedSafe.sol"),
-            0
+            1
+        );
+    }
+
+    #[test]
+    fn reports_permissive_v_even_with_message_nonce() {
+        assert_eq!(
+            run("../tests/contract-playground/src/signature-malleability/MalleabilityPermissiveVNonce.sol"),
+            1
         );
     }
 

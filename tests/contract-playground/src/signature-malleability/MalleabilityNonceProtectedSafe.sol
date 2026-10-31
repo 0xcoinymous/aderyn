@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-// Raw ecrecover without an s check, but replay protection comes from the signed nonce: the malleated
-// signature authorizes the same, already consumed nonce.
+// Raw ecrecover without an s check. Replay protection comes from the signed nonce, so the malleated
+// signature authorizes the same, already consumed nonce and cannot be exploited; the non-canonical
+// acceptance is still reported as a weakness.
 contract MalleabilityNonceProtectedSafe {
     mapping(address => uint256) public nonces;
     mapping(address => mapping(address => uint256)) public allowance;
