@@ -205,7 +205,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
         .collect();
     let mut contract_source_by_id = HashMap::new();
     for contract in context.contract_definitions() {
-        contract_source_by_id.insert(contract.id, contract.peek(context).unwrap_or_default());
+        contract_source_by_id.insert(contract.id, super::signature_utils::blank_comments(&contract.peek(context).unwrap_or_default()));
     }
 
     let span_by_id: HashMap<NodeID, SrcSpan> = function_spans.iter().copied().collect();
@@ -215,7 +215,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
     let mut functions_by_file_and_name: HashMap<(usize, String), Vec<NodeID>> = HashMap::new();
 
     for function in context.function_definitions() {
-        let source = function.peek(context).unwrap_or_default();
+        let source = super::signature_utils::blank_comments(&function.peek(context).unwrap_or_default());
         let parameters = parse_parameters(&source);
         if let Some(name) = function_name(&source) {
             functions_by_name.entry(name.clone()).or_default().push(function.id);
@@ -650,7 +650,19 @@ fn domain_helper_binding_is_suspicious(function: &FunctionModel) -> bool {
             break;
         };
         let pos = from + rel;
-        let Some(args) = parse_call_args_at(source, pos) else {
+        // Only a call of a helper whose name contains "domain" binds a domain; a variable such as
+        // `domainSeparator` must not pick up the arguments of the next call (e.g. ecrecover(digest, v, r, s)).
+        let bytes = source.as_bytes();
+        let mut end = pos;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        let open = end + source[end..].len() - source[end..].trim_start().len();
+        if bytes.get(open) != Some(&b'(') {
+            from = pos.saturating_add("domain".len());
+            continue;
+        }
+        let Some(args) = parse_call_args_at(source, open) else {
             from = pos.saturating_add("domain".len());
             continue;
         };
@@ -1369,6 +1381,7 @@ fn is_canonical_1901_prefix(expression: &str, model: &FunctionModel) -> bool {
     c.contains("\\x19\\x01")
         || c.contains("hex\"1901\"")
         || c == "0x1901"
+        || c == "uint16(0x1901)"
         || c == "bytes2(0x1901)"
         || c == "bytes2(hex\"1901\")"
 }
@@ -2311,5 +2324,25 @@ mod eip712_implementation_tests {
             run("../tests/contract-playground/src/eip712-implementation/HelperEncodedSplitPrefix.sol"),
             0
         );
+    }
+
+    #[test]
+    fn accepts_local_domain_separator_variable() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/CompoundDelegate.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_uint16_1901_prefix() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/Uint16PrefixPermit.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_recomputed_domain_separator() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/SolmatePermit.sol"), 0);
+    }
+
+    #[test]
+    fn detects_domain_separator_cached_at_deployment() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/AnyswapPermit.sol"), 1);
     }
 }

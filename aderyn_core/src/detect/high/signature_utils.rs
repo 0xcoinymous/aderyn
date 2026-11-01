@@ -683,3 +683,248 @@ fn is_language_keyword(word: &str) -> bool {
             | "while"
     )
 }
+
+/// The variable that receives the recovered signer, as in `address signatory = ecrecover(...)`. The
+/// recovered address is the signer by definition, so state keyed by it (`nonces[signatory]++`) is the
+/// signer's own namespace even when the address is never compared with a signed parameter.
+pub(crate) fn recovered_into_variable(source: &str, pos: usize) -> Option<String> {
+    let before = source.get(..pos)?;
+    let start = before.rfind([';', '{', '}']).map_or(0, |i| i + 1);
+    let mut statement = before[start..].trim();
+    // Drop a qualifier chain in front of a member call: `ECDSA.`, `hash.`, `digest.toEth...().`.
+    while let Some(rest) = statement.strip_suffix('.') {
+        let mut rest = rest.trim_end();
+        if rest.ends_with(')') {
+            let mut depth = 0i32;
+            let mut cut = None;
+            for (i, ch) in rest.char_indices().rev() {
+                match ch {
+                    ')' => depth += 1,
+                    '(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            cut = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest = rest[..cut?].trim_end();
+        }
+        let ident_start = rest
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |i| i + 1);
+        if ident_start == rest.len() {
+            return None;
+        }
+        statement = rest[..ident_start].trim_end();
+    }
+    let lhs = statement.strip_suffix('=')?.trim_end();
+    if lhs.ends_with(['=', '!', '<', '>']) {
+        return None;
+    }
+    let mut words = lhs.split_whitespace().filter(|w| !matches!(*w, "address" | "payable"));
+    let name = words.next()?;
+    if words.next().is_some()
+        || name.is_empty()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        || name.as_bytes()[0].is_ascii_digit()
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Writes SafeMath calls as operators: `x.add(y)` -> `x+(y)`, `x.sub(y)` -> `x-(y)` and
+/// `SafeMath.add(x, y)` -> `(x)+(y)`, so that `nonces[a] = nonces[a].add(1)` reads as an increment.
+pub(crate) fn desugar_safemath(expression: &str) -> String {
+    let mut text = expression.to_string();
+    for (method, op) in [("add", '+'), ("sub", '-')] {
+        let library_call = format!("SafeMath.{method}(");
+        while let Some(start) = text.find(&library_call) {
+            let open = start + library_call.len() - 1;
+            let Some(close) = matching_delimiter(&text, open, '(', ')') else { break };
+            let args = split_top_level(&text[open + 1..close], ',');
+            if args.len() != 2 {
+                break;
+            }
+            let replaced = format!("({}){op}({})", args[0].trim(), args[1].trim());
+            text.replace_range(start..=close, &replaced);
+        }
+        let member_call = format!(".{method}(");
+        while let Some(dot) = text.find(&member_call) {
+            let open = dot + member_call.len() - 1;
+            let Some(close) = matching_delimiter(&text, open, '(', ')') else { break };
+            let replaced = format!("{op}({})", &text[open + 1..close]);
+            text.replace_range(dot..=close, &replaced);
+        }
+    }
+    text
+}
+
+/// The source with every comment replaced by spaces (line breaks kept), so offsets stay valid and
+/// text in comments (`// increase nonce (to avoid re-use)`, commented-out checks) is never analysed.
+/// String literals are skipped, so `"https://..."` is not taken for a comment.
+pub(crate) fn blank_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote && bytes[i] != b'\n' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    out[i] = b' ';
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let end = source[i + 2..].find("*/").map_or(bytes.len(), |p| i + 2 + p + 2);
+                for byte in &mut out[i..end] {
+                    if *byte != b'\n' {
+                        *byte = b' ';
+                    }
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    // Every byte of a comment, including the bytes of multi-byte characters, became a space, so the
+    // text is still valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+}
+
+/// Whether `pos` lies in the body of an `if` or `else`: the block right after the condition, or
+/// the single statement when there is no block. `if`/`else` must be whole words (not `verify`), and an
+/// `unchecked { }` block after `if (..) revert ..;` is not the body of that `if`.
+pub(crate) fn inside_conditional_body(source: &str, pos: usize) -> bool {
+    let bytes = source.as_bytes();
+    let pos = pos.min(source.len());
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let body_contains = |after: usize| -> bool {
+        let rest = &source[after..];
+        let skip = rest.len() - rest.trim_start().len();
+        let start = after + skip;
+        if bytes.get(start) == Some(&b'{') {
+            return matching_delimiter(source, start, '{', '}').is_some_and(|end| pos > start && pos < end);
+        }
+        // Single statement: up to the next `;` outside brackets.
+        let mut depth = 0i32;
+        for (i, ch) in source[start..].char_indices() {
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ';' if depth <= 0 => return pos >= start && pos <= start + i,
+                _ => {}
+            }
+        }
+        false
+    };
+    let mut i = 0;
+    while i < pos {
+        let word_start = i == 0 || !is_ident(bytes[i - 1]);
+        if word_start && bytes[i..].starts_with(b"if") && !bytes.get(i + 2).is_some_and(|b| is_ident(*b)) {
+            let rest = &source[i + 2..];
+            let open = i + 2 + (rest.len() - rest.trim_start().len());
+            if bytes.get(open) == Some(&b'(') {
+                if let Some(close) = matching_delimiter(source, open, '(', ')') {
+                    if close < pos && body_contains(close + 1) {
+                        return true;
+                    }
+                }
+            }
+        }
+        if word_start && bytes[i..].starts_with(b"else") && !bytes.get(i + 4).is_some_and(|b| is_ident(*b)) {
+            let rest = &source[i + 4..];
+            let next = rest.trim_start();
+            if !next.starts_with("if") && body_contains(i + 4) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The body after an `if (..)` stops execution: `revert`, `throw`, `return false`, or a block that
+/// starts with one of them.
+pub(crate) fn body_reverts(after_condition: &str) -> bool {
+    let body = after_condition.trim_start();
+    let body = body.strip_prefix('{').map_or(body, str::trim_start);
+    let compacted = compact(body);
+    body.starts_with("revert")
+        || body.starts_with("throw")
+        || compacted.starts_with("returnfalse;")
+        || compacted.starts_with("return(false);")
+}
+
+/// The logical negation of a condition, with De Morgan for `||`/`&&` and inverted comparisons, so that
+/// `if (cond) revert` can be read as `require(negate_condition(cond))`.
+pub(crate) fn negate_condition(condition: &str) -> String {
+    let mut c = condition.trim();
+    while c.starts_with('(') && matching_delimiter(c, 0, '(', ')') == Some(c.len() - 1) {
+        c = c[1..c.len() - 1].trim();
+    }
+    for (op, join) in [("||", " && "), ("&&", " || ")] {
+        let mut parts = Vec::new();
+        let mut rest = c;
+        while let Some(idx) = find_top_level_operator(rest, op) {
+            parts.push(rest[..idx].to_string());
+            rest = &rest[idx + 2..];
+        }
+        if !parts.is_empty() {
+            parts.push(rest.to_string());
+            return parts.iter().map(|p| negate_condition(p)).collect::<Vec<_>>().join(join);
+        }
+    }
+    for (op, inverse) in [("!=", "=="), ("==", "!="), (">=", "<"), ("<=", ">"), (">", "<="), ("<", ">=")] {
+        if let Some(idx) = find_top_level_operator(c, op) {
+            return format!("{} {inverse} {}", c[..idx].trim(), c[idx + op.len()..].trim());
+        }
+    }
+    match c.strip_prefix('!') {
+        Some(inner) if !inner.starts_with('=') => inner.trim().to_string(),
+        _ => format!("!{c}"),
+    }
+}
+
+/// The digest of a member recovery call that starts at `pos`: the first argument for a library call
+/// (`ECDSA.recover(hash, sig)`), and the receiver for a `using ECDSA for bytes32` call
+/// (`hash.recover(sig)`, `keccak256(..).toEthSignedMessageHash().recover(sig)`).
+pub(crate) fn member_recovery_digest(source: &str, pos: usize, member: &str) -> Option<String> {
+    let needle = format!(".{member}(");
+    let tail = source.get(pos..)?;
+    let dot = pos + tail.find(&needle)?;
+    let receiver = source[pos..dot].trim();
+    let args = parse_call_args_at(source, dot)?;
+    let is_library = !receiver.is_empty()
+        && receiver.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && receiver.as_bytes()[0].is_ascii_uppercase();
+    if is_library || receiver.is_empty() {
+        args.first().cloned()
+    } else {
+        Some(receiver.to_string())
+    }
+}
+
+/// The receiver and arguments of a member call `receiver.member(args)` whose expression starts at
+/// `pos`. The receiver is `None` for a library or contract name (`ECDSA.recover(..)`).
+pub(crate) fn member_call_parts(source: &str, pos: usize, member: &str) -> Option<(Option<String>, Vec<String>)> {
+    let tail = source.get(pos..)?;
+    let dot = pos + tail.find(&format!(".{member}("))?;
+    let receiver = source[pos..dot].trim();
+    let args = parse_call_args_at(source, dot)?;
+    let is_type_name = receiver.is_empty()
+        || (receiver.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && receiver.as_bytes()[0].is_ascii_uppercase());
+    Some(((!is_type_name).then(|| receiver.to_string()), args))
+}

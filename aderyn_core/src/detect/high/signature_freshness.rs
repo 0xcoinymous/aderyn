@@ -402,7 +402,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
         else {
             continue;
         };
-        let source = function.peek(context).unwrap_or_default();
+        let source = super::signature_utils::blank_comments(&function.peek(context).unwrap_or_default());
         let local_pos = node_span.start.saturating_sub(fspan.start);
         let args = parse_call_args_at(&source, local_pos).unwrap_or_default();
         call_sites_by_function
@@ -413,7 +413,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
 
     let mut models = BTreeMap::new();
     for function in context.function_definitions() {
-        let source = function.peek(context).unwrap_or_default();
+        let source = super::signature_utils::blank_comments(&function.peek(context).unwrap_or_default());
         let sig = parse_function_signature(&source);
         let assignment_facts = collect_assignment_facts(&source);
         let assignments = assignment_facts

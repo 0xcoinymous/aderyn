@@ -13,7 +13,7 @@ use crate::{
 use super::signature_utils::{
     collect_assignments, compact, contains_word, expand_expression, find_top_level_operator,
     function_name, identifier_sequence, identifiers_in_text, is_public_or_external,
-    matching_delimiter, operand_before, parse_call_args_at, returned_expressions,
+    matching_delimiter, operand_before, parse_call_args_at, recovered_into_variable, returned_expressions,
     split_statements, split_top_level, substitute_identifiers, SrcSpan,
 };
 
@@ -42,6 +42,8 @@ struct CallSite {
     args: Vec<String>,
     pos: usize,
     principal_after_call: Option<String>,
+    /// The variable that receives the result, e.g. `signer` in `address signer = recoverSigner(..)`.
+    recovered_into: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -256,7 +258,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
     let mut functions_by_name: HashMap<String, Vec<NodeID>> = HashMap::new();
     let mut functions_by_file_and_name: HashMap<(usize, String), Vec<NodeID>> = HashMap::new();
     for function in context.function_definitions() {
-        let source = function.peek(context).unwrap_or_default();
+        let source = super::signature_utils::blank_comments(&function.peek(context).unwrap_or_default());
         if let Some(name) = function_name(&source) {
             functions_by_name.entry(name.clone()).or_default().push(function.id);
             if let Some(span) = span_by_id.get(&function.id) {
@@ -324,6 +326,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
                 args,
                 pos: local_pos,
                 principal_after_call: principal_after_call(source, local_pos),
+                        recovered_into: recovered_into_variable(source, local_pos),
             },
         );
     }
@@ -340,7 +343,20 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
             continue;
         };
         let local_pos = node_span.start.saturating_sub(function_span.start);
-        let args = parse_call_args_at(source, local_pos).unwrap_or_default();
+        let (receiver, member_args) =
+            super::signature_utils::member_call_parts(source, local_pos, &member.member_name)
+                .unwrap_or((None, parse_call_args_at(source, local_pos).unwrap_or_default()));
+        // A `using L for T` call `x.f(a)` passes `x` as the first parameter of `f`.
+        let bound_args = |callee: NodeID| -> Vec<String> {
+            let arity = source_by_id.get(&callee).map_or(0, |callee_source| parse_parameters(callee_source).len());
+            match &receiver {
+                Some(receiver) if arity == member_args.len() + 1 => {
+                    std::iter::once(receiver.clone()).chain(member_args.iter().cloned()).collect()
+                }
+                _ => member_args.clone(),
+            }
+        };
+        let args = member_args.clone();
 
         // The AST records the exact target of a library or internal member call; use it when it is
         // an implemented function, and fall back to name lookup only otherwise.
@@ -355,9 +371,10 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
                 CallSite {
                     callee,
                     name: member.member_name.clone(),
-                    args: args.clone(),
+                    args: bound_args(callee),
                     pos: local_pos,
                     principal_after_call: principal_after_call(source, local_pos),
+                        recovered_into: recovered_into_variable(source, local_pos),
                 },
             );
             continue;
@@ -372,9 +389,10 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
                     CallSite {
                         callee: ids[0],
                         name: member.member_name.clone(),
-                        args: args.clone(),
+                        args: bound_args(ids[0]),
                         pos: local_pos,
                         principal_after_call: principal_after_call(source, local_pos),
+                        recovered_into: recovered_into_variable(source, local_pos),
                     },
                 );
                 continue;
@@ -388,9 +406,10 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
                     CallSite {
                         callee: ids[0],
                         name: member.member_name.clone(),
-                        args: args.clone(),
+                        args: bound_args(ids[0]),
                         pos: local_pos,
                         principal_after_call: principal_after_call(source, local_pos),
+                        recovered_into: recovered_into_variable(source, local_pos),
                     },
                 );
                 continue;
@@ -398,6 +417,13 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
         }
 
         if is_signature_member(&member.member_name) {
+            // `hash.recover(sig)` through `using ECDSA for bytes32`: the receiver is the digest.
+            let args = match &receiver {
+                Some(receiver) if matches!(member.member_name.as_str(), "recover" | "tryRecover" | "recoverChecked") => {
+                    std::iter::once(receiver.clone()).chain(args).collect()
+                }
+                _ => args,
+            };
             unresolved_signature_members
                 .entry(caller)
                 .or_default()
@@ -488,6 +514,9 @@ fn analyze_direct_auth(
         if let Some(principal) = principal_after_call(source, *pos) {
             add_principal_expression(&mut out, &principal, assignments);
         }
+        if let Some(recovered) = recovered_into_variable(source, *pos) {
+            add_recovered_principal(&mut out, recovered);
+        }
     }
 
     for (name, args, pos) in unresolved_members {
@@ -511,6 +540,8 @@ fn analyze_direct_auth(
         add_authenticated_expression(&mut out, digest, assignments);
         if let Some(principal) = principal_after_call(source, *pos) {
             add_principal_expression(&mut out, &principal, assignments);
+        } else if let Some(recovered) = recovered_into_variable(source, *pos) {
+            add_recovered_principal(&mut out, recovered);
         } else if let Some(index) = explicit_principal_index {
             if let Some(principal) = args.get(index) {
                 add_principal_expression(&mut out, principal, assignments);
@@ -542,6 +573,12 @@ fn add_principal_expression(
     let expanded = expand_expression(expression, assignments, 3);
     summary.principal_roots.extend(identifiers_in_text(&expanded));
     summary.authenticated_roots.extend(identifiers_in_text(&expanded));
+}
+
+/// The recovered signer itself, without expanding its assignment (which would add v, r, s).
+fn add_recovered_principal(summary: &mut AuthSummary, name: String) {
+    summary.principal_roots.insert(name.clone());
+    summary.authenticated_roots.insert(name);
 }
 
 fn principal_after_call(source: &str, pos: usize) -> Option<String> {
@@ -581,7 +618,10 @@ fn propagate_auth_summaries(models: &BTreeMap<NodeID, FunctionModel>) -> BTreeMa
         let mut changed = false;
         for model in models.values() {
             let mut next = model.direct_auth.clone();
-            for call in &model.calls {
+            let mut previous_verifier_end: Option<usize> = None;
+            let mut calls: Vec<&CallSite> = model.calls.iter().collect();
+            calls.sort_by_key(|call| call.pos);
+            for call in calls {
                 let Some(callee_model) = models.get(&call.callee) else {
                     continue;
                 };
@@ -592,10 +632,23 @@ fn propagate_auth_summaries(models: &BTreeMap<NodeID, FunctionModel>) -> BTreeMa
                     continue;
                 }
                 next.signature_verification = true;
-                next.signature_count = next
-                    .signature_count
-                    .saturating_add(callee.signature_count)
-                    .min(8);
+                // `verifyA(..) || verifyB(..)` accepts one signature in either encoding; it is one
+                // authorization, not two signatures that each need their own nonce.
+                let alternative = previous_verifier_end.is_some_and(|end| {
+                    model.source.get(end..call.pos).is_some_and(|between| compact(between) == "||")
+                });
+                // One call verifies one signature: the recovery sites inside a helper such as
+                // ECDSA.recover are alternative branches (65- or 64-byte signatures), not several signers.
+                if !alternative {
+                    next.signature_count = next
+                        .signature_count
+                        .saturating_add(callee.signature_count)
+                        .min(8);
+                }
+                previous_verifier_end = model.source.get(call.pos..).and_then(|tail| {
+                    let open = call.pos + tail.find('(')?;
+                    matching_delimiter(&model.source, open, '(', ')').map(|close| close + 1)
+                });
                 map_auth_roots_through_call(
                     &mut next.authenticated_roots,
                     &callee.authenticated_roots,
@@ -614,6 +667,8 @@ fn propagate_auth_summaries(models: &BTreeMap<NodeID, FunctionModel>) -> BTreeMa
                     let expanded = expand_expression(principal, &model.assignments, 3);
                     next.principal_roots.extend(identifiers_in_text(&expanded));
                     next.authenticated_roots.extend(identifiers_in_text(&expanded));
+                } else if let Some(recovered) = &call.recovered_into {
+                    add_recovered_principal(&mut next, recovered.clone());
                 }
             }
             if previous.get(&model.id) != Some(&next) {
@@ -776,6 +831,33 @@ fn assess_entry_function(
         }
     }
 
+    // `require(nonce == _useNonce(signer))`: a signed value compared with a helper that returns and
+    // advances a counter checks and consumes that counter.
+    for call in &model.calls {
+        let (Some(helper), Some(callee)) = (helper_summaries.get(&call.callee), models.get(&call.callee))
+        else {
+            continue;
+        };
+        let Some(counter) = helper
+            .writes
+            .iter()
+            .find(|write| !write.conditional && counter_write_advances(write, &callee.assignments))
+        else {
+            continue;
+        };
+        if !compared_with_signed_value(&model.source, call.pos, auth, &model.assignments) {
+            continue;
+        }
+        let slot = instantiate_slot(&counter.slot, callee, call, &model.assignments);
+        if slot_keys_authenticated(&slot, auth, &model.assignments)
+            && !guarded_slots.iter().any(|guarded: &StateSlot| guarded.same_storage_location(&slot))
+        {
+            effective += 1;
+            candidate_activity = true;
+            guarded_slots.push(slot);
+        }
+    }
+
     // A counter whose current value is in the signed digest and that is advanced unconditionally
     // (e.g. `nonces[owner]++` inside `abi.encode`, or `_useNonce(owner)`) is consumed even without
     // an explicit guard: a signature over the old value cannot verify again.
@@ -880,6 +962,34 @@ fn with_digest_helper_returns(
         }
     }
     out
+}
+
+/// The call at `pos` is one side of `==`/`!=` in its statement, and the other side is signed.
+fn compared_with_signed_value(
+    source: &str,
+    pos: usize,
+    auth: &AuthSummary,
+    assignments: &HashMap<String, String>,
+) -> bool {
+    let pos = pos.min(source.len());
+    let start = source[..pos].rfind([';', '{', '}']).map_or(0, |i| i + 1);
+    let end = source[pos..].find(';').map_or(source.len(), |i| pos + i);
+    let Some(open) = source[pos..end].find('(').map(|i| pos + i) else {
+        return false;
+    };
+    let Some(close) = matching_delimiter(source, open, '(', ')') else {
+        return false;
+    };
+    let before = &source[start..pos];
+    let after = source.get(close + 1..end).unwrap_or("");
+    let side = if let Some(i) = before.rfind("==").or_else(|| before.rfind("!=")) {
+        before[..i].rsplit(['(', ',']).next().unwrap_or("")
+    } else if let Some(i) = after.find("==").or_else(|| after.find("!=")) {
+        after[i + 2..].split([')', ',']).next().unwrap_or("")
+    } else {
+        return false;
+    };
+    expression_is_authenticated(side, auth, assignments)
 }
 
 fn write_is_digest_bound_counter(
@@ -1177,7 +1287,39 @@ fn collect_writes_from_statement(
     locals: &BTreeSet<String>,
     out: &mut Vec<WriteFact>,
 ) {
-    let conditional = is_inside_conditional_block(whole_source, pos) || contains_word(statement, "if");
+    // A statement split at `;` can start with the `}` that closes the previous block; the write itself
+    // starts after it.
+    let mut rest = statement;
+    loop {
+        let trimmed = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '{' || c == '}');
+        match ["else", "unchecked"].iter().find_map(|kw| {
+            trimmed.strip_prefix(kw).filter(|r| !r.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
+        }) {
+            Some(after) => rest = after,
+            None => {
+                rest = trimmed;
+                break;
+            }
+        }
+    }
+    let pos = pos + (statement.len() - rest.len());
+    // In `if (nonce != nonces[a]++) revert ..;` the only write is in the condition, which always runs.
+    let mut head = statement.trim_start();
+    while let Some(rest) = head
+        .strip_prefix("unchecked")
+        .or_else(|| head.strip_prefix('{'))
+        .or_else(|| head.strip_prefix('}'))
+    {
+        head = rest.trim_start();
+    }
+    let revert_guard = head.strip_prefix("if").is_some_and(|rest| {
+        let rest = rest.trim_start();
+        rest.starts_with('(')
+            && matching_delimiter(rest, 0, '(', ')')
+                .is_some_and(|close| super::signature_utils::body_reverts(&rest[close + 1..]))
+    });
+    let conditional = is_inside_conditional_block(whole_source, pos)
+        || (contains_word(statement, "if") && !revert_guard);
 
     if let Some(delete_pos) = find_word_local(statement, "delete") {
         let tail = statement[delete_pos + "delete".len()..].trim_start();
@@ -1203,7 +1345,7 @@ fn collect_writes_from_statement(
         while let Some(index) = statement[from..].find(needle).map(|x| from + x) {
             let lhs = lvalue_before(statement, index);
             if let Some(slot) = extract_first_state_slot(&lhs, assignments, parameters, locals) {
-                let rhs = expression_after_operator(statement, index + needle.len());
+                let rhs = super::signature_utils::desugar_safemath(&expression_after_operator(statement, index + needle.len()));
                 out.push(WriteFact {
                     slot,
                     kind,
@@ -1269,7 +1411,7 @@ fn collect_writes_from_statement(
         }
         let lhs = lvalue_before(statement, index);
         if let Some(slot) = extract_first_state_slot(&lhs, assignments, parameters, locals) {
-            let rhs = expression_after_operator(statement, index + 1);
+            let rhs = super::signature_utils::desugar_safemath(&expression_after_operator(statement, index + 1));
             out.push(WriteFact {
                 slot,
                 kind: WriteKind::Assign,
@@ -1297,6 +1439,12 @@ fn append_instantiated_helper_guards(
         let Some(callee) = models.get(&call.callee) else {
             continue;
         };
+        // A pure helper (SafeMath.add's `require(c >= a)`) cannot read storage, so its checks never
+        // guard authorization state.
+        let header = callee.source.split('{').next().unwrap_or("");
+        if contains_word(header, "pure") {
+            continue;
+        }
         for guard in &helper.guards {
             let mut instantiated = guard.clone();
             instantiated.slot = instantiate_slot(&guard.slot, callee, call, &caller.assignments);
@@ -1643,7 +1791,7 @@ fn has_dangerous_cross_function_mutation(
             // decisive condition is the missing state dependency in the authorization path.
             if slot_is_cancellation_family(&write.slot)
                 && slot_keys_authenticated(&write.slot, &entry_auth, &sibling.assignments)
-                && !source_reads_storage_family(&entry.source, &write.slot)
+                && !reachable_reads_storage_family(entry, models, &write.slot)
             {
                 return true;
             }
@@ -1671,6 +1819,30 @@ fn slot_is_cancellation_family(slot: &StateSlot) -> bool {
         slot.field.as_deref().unwrap_or("").to_ascii_lowercase()
     );
     lower.contains("cancel") || lower.contains("invalidate") || lower.contains("revok")
+}
+
+/// The entry or a function it calls (up to four levels, e.g. `state(proposalId)`) reads the family.
+fn reachable_reads_storage_family(
+    entry: &FunctionModel,
+    models: &BTreeMap<NodeID, FunctionModel>,
+    slot: &StateSlot,
+) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut frontier = vec![entry];
+    for _ in 0..5 {
+        let mut next = Vec::new();
+        for function in frontier {
+            if !seen.insert(function.id) {
+                continue;
+            }
+            if source_reads_storage_family(&function.source, slot) {
+                return true;
+            }
+            next.extend(function.calls.iter().filter_map(|call| models.get(&call.callee)));
+        }
+        frontier = next;
+    }
+    false
 }
 
 fn source_reads_storage_family(source: &str, slot: &StateSlot) -> bool {
@@ -1844,6 +2016,7 @@ fn slot_keys_authenticated(
         let expanded = expand_expression(key, assignments, 4);
         let ids = identifiers_in_text(&expanded);
         ids.is_empty()
+            || is_signature_recovery(&expanded)
             || ids.iter().all(|id| {
                 is_nonsemantic_member_identifier(id)
                     || auth.authenticated_roots.contains(id)
@@ -1852,6 +2025,24 @@ fn slot_keys_authenticated(
             || (expanded.contains("msg.sender")
                 && auth.principal_roots.iter().any(|p| p == "msg" || p == "sender"))
     })
+}
+
+/// `ecrecover(..)`, `ECDSA.recover(..)` or `hash.recover(..)` as a whole expression: the recovered
+/// address is the signer, so a slot keyed by it is the signer's own namespace.
+fn is_signature_recovery(expression: &str) -> bool {
+    let mut text = compact(expression);
+    while text.starts_with('(') && text.ends_with(')') {
+        text = text[1..text.len() - 1].to_string();
+    }
+    let Some(open) = text.find('(') else {
+        return false;
+    };
+    let callee = &text[..open];
+    let is_recovery = callee == "ecrecover"
+        || callee.ends_with(".recover")
+        || callee.ends_with(".recoverSigner")
+        || callee == "recoverSigner";
+    is_recovery && matching_delimiter(&text, open, '(', ')') == Some(text.len() - 1)
 }
 
 fn expression_is_authenticated(
@@ -2111,6 +2302,9 @@ fn extract_conditions(source: &str) -> Vec<(String, usize)> {
             let raw = &source[open + 1..close];
             let condition = if keyword == "require" || keyword == "assert" {
                 split_top_level(raw, ',').into_iter().next().unwrap_or_default()
+            } else if super::signature_utils::body_reverts(&source[close + 1..]) {
+                // `if (cond) revert ..;` is `require(!cond)`.
+                super::signature_utils::negate_condition(raw)
             } else {
                 raw.to_string()
             };
@@ -2254,14 +2448,7 @@ fn early_return_before_write(source: &str, guard_pos: usize, write_pos: usize) -
 }
 
 fn is_inside_conditional_block(source: &str, pos: usize) -> bool {
-    let prefix = &source[..pos.min(source.len())];
-    let last_if = prefix.rfind("if");
-    let last_open = prefix.rfind('{');
-    let last_close = prefix.rfind('}');
-    match (last_if, last_open, last_close) {
-        (Some(if_pos), Some(open), close) if if_pos < open => close.map(|c| c < open).unwrap_or(true),
-        _ => false,
-    }
+    super::signature_utils::inside_conditional_body(source, pos)
 }
 
 fn find_word_local(text: &str, word: &str) -> Option<usize> {
@@ -2506,5 +2693,45 @@ mod nonce_management_tests {
             run("../tests/contract-playground/src/nonce-management/NonceImplicitReset.sol"),
             1
         );
+    }
+
+    #[test]
+    fn accepts_nonce_of_recovered_signer() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/CompoundDelegate.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_vote_once_through_storage_pointer() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/GovernorVote.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_safemath_nonce_after_comment() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/MetaTxSafeMathComment.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_signature_in_two_encodings() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/AnyswapPermit.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_solmate_permit_in_unchecked_block() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/SolmatePermit.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_nonce_advanced_in_revert_guard() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/RevertGuardDelegate.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_nonce_compared_with_use_nonce() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/VotesUseNonce.sol"), 0);
+    }
+
+    #[test]
+    fn handles_multibyte_characters() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/UnicodeStrings.sol"), 0);
     }
 }

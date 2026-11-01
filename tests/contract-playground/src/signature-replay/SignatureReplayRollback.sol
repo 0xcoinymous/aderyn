@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+// The nonce is consumed before the external call; if the call fails the whole transaction reverts,
+// including its effect, so the signature is still used at most once. Not reported.
 contract SignatureReplayRollback {
     address public signer;
     mapping(address => uint256) public nonces;

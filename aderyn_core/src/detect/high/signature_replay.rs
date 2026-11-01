@@ -155,6 +155,8 @@ struct CallSite {
     pos: usize,
     in_condition: bool,
     negated_in_condition: bool,
+    /// The variable that receives the result, e.g. `signer` in `address signer = recoverSigner(..)`.
+    recovered_into: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +169,9 @@ struct FunctionModel {
     entry_point: bool,
     direct_signature_sink: bool,
     direct_auth_roots: Vec<String>,
+    /// Variables assigned the recovered signer (`address signatory = ecrecover(..)`). The recovered
+    /// address is the signer, so state keyed by it belongs to the signer.
+    recovered_vars: Vec<String>,
     calls: Vec<CallSite>,
     assignments: HashMap<String, String>,
     guards: Vec<GuardFact>,
@@ -223,39 +228,29 @@ impl IssueDetector for SignatureReplayDetector {
 
             // Class 1: a signed state-changing operation has no effective authenticated one-time
             // invariant. View-only/check-only signature functions are intentionally ignored.
-            if facts.sensitive_effect && effective.is_empty() && bound.is_empty() {
-                vulnerable.insert(model.id);
-                analyses.insert(model.id, facts);
-                continue;
-            }
-
-            // Class 3: the authorization is consumed, but a later external execution path can revert
-            // the whole transaction. The old authorization is then restored together with all state.
-            let external_pos = first_external_effect_position(&model.source).unwrap_or(0);
-            if facts.reverting_external_flow
-                && (effective.iter().any(|(_, write)| write.pos <= external_pos)
-                    || bound.iter().any(|write| write.pos <= external_pos))
+            if facts.sensitive_effect
+                && effective.is_empty()
+                && bound.is_empty()
+                && !has_external_nonce_update(&model.source, &facts.auth_symbols)
             {
                 vulnerable.insert(model.id);
                 analyses.insert(model.id, facts);
                 continue;
             }
 
+            // A transaction that reverts after consuming the authorization also undoes its effect, so the
+            // signature is still used at most once; that is not reported as replay.
+
             // Strong Class 4 signal: replay state is partitioned by an unsigned namespace/domain key.
             // Example shape: usedByDomain[domain][authorizationId], where authorizationId is signed
             // but `domain` is not. The same signature can be consumed once per unsigned namespace.
+            // Struct fields (`.hasVoted`) are part of the location, not a namespace.
             if effective.iter().any(|(guard, _)| {
-                guard.slot.keys.len() >= 2
-                    && guard
-                        .slot
-                        .keys
-                        .iter()
-                        .any(|k| expr_is_authenticated(k, &facts.auth_symbols))
-                    && guard
-                        .slot
-                        .keys
-                        .iter()
-                        .any(|k| !expr_is_authenticated(k, &facts.auth_symbols))
+                let index_keys: Vec<&String> =
+                    guard.slot.keys.iter().filter(|k| !k.starts_with('.')).collect();
+                index_keys.len() >= 2
+                    && index_keys.iter().any(|k| expr_is_authenticated(k, &facts.auth_symbols))
+                    && index_keys.iter().any(|k| !expr_is_authenticated(k, &facts.auth_symbols))
             }) {
                 vulnerable.insert(model.id);
                 analyses.insert(model.id, facts);
@@ -399,7 +394,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
         let Some(function) = context.function_definitions().into_iter().find(|f| f.id == id) else {
             continue;
         };
-        let source = function.peek(context).unwrap_or_default();
+        let source = super::signature_utils::blank_comments(&function.peek(context).unwrap_or_default());
         if name == "isValid" && !looks_like_generic_signature_verifier_call(&source) {
             continue;
         }
@@ -430,7 +425,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
         let Some(function) = context.function_definitions().into_iter().find(|f| f.id == caller) else {
             continue;
         };
-        let source = function.peek(context).unwrap_or_default();
+        let source = super::signature_utils::blank_comments(&function.peek(context).unwrap_or_default());
         let local_pos = node_span.start.saturating_sub(fspan.start);
         let args = parse_call_args_at(&source, local_pos).unwrap_or_default();
         let (in_condition, negated) = call_condition_context(&source, local_pos);
@@ -443,6 +438,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
                 pos: local_pos,
                 in_condition,
                 negated_in_condition: negated,
+                recovered_into: super::signature_utils::recovered_into_variable(&source, local_pos),
             });
     }
 
@@ -451,10 +447,11 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
         let Some(span) = SrcSpan::parse(&function.src) else {
             continue;
         };
-        let source = function.peek(context).unwrap_or_default();
+        let source = super::signature_utils::blank_comments(&function.peek(context).unwrap_or_default());
         let params = parse_parameter_names(&source);
         let assignments = collect_assignments(&source);
-        let guards = collect_guards(&source, &params);
+        let mut guards = collect_guards(&source, &params);
+        resolve_guard_aliases(&mut guards, &assignments);
         let mut writes = collect_writes(&source);
         resolve_storage_aliases(&mut writes, &assignments);
         let returned_slot = collect_returned_slot(&source);
@@ -465,6 +462,13 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
             .into_iter()
             .flatten()
             .filter_map(|(pos, name)| digest_argument_at(&source, *pos, name))
+            .collect();
+        let recovered_vars = sink_positions
+            .get(&function.id)
+            .into_iter()
+            .flatten()
+            .filter(|(_, name)| matches!(name.as_str(), "ecrecover" | "recover"))
+            .filter_map(|(pos, _)| super::signature_utils::recovered_into_variable(&source, *pos))
             .collect();
 
         models.insert(
@@ -478,6 +482,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
                 entry_point,
                 direct_signature_sink,
                 direct_auth_roots,
+                recovered_vars,
                 calls: call_sites_by_function.remove(&function.id).unwrap_or_default(),
                 assignments,
                 guards,
@@ -587,7 +592,10 @@ fn analyze_entry(
         return AnalysisFacts::default();
     };
     let mut facts = AnalysisFacts {
-        auth_symbols: resolve_auth_symbols(model, &model.direct_auth_roots),
+        auth_symbols: resolve_auth_symbols(model, &model.direct_auth_roots)
+            .into_iter()
+            .chain(model.recovered_vars.iter().cloned())
+            .collect(),
         guards: model.guards.clone(),
         writes: model.writes.clone(),
         sensitive_effect: model.sensitive_effect,
@@ -625,6 +633,21 @@ fn inline_helper_facts(
             facts.writes.push(write.substitute(&substitutions));
         }
 
+        // `require(nonce == _useNonce(signer))`: the guard compares with the counter the helper
+        // returns and advances, so its location is that counter.
+        if let Some(name) = function_name(&callee.source) {
+            if let Some(counter) =
+                callee.writes.iter().find(|w| !w.conditional && write_advances_counter(w, &callee.assignments))
+            {
+                let slot = counter.slot.substitute(&substitutions);
+                for guard in facts.guards.iter_mut() {
+                    if guard.slot.base == name && guard.slot.keys.is_empty() {
+                        guard.slot = slot.clone();
+                    }
+                }
+            }
+        }
+
         // `_isUsed(id)`-style helper used directly in a require/if condition.
         if call.in_condition {
             if let Some(returned) = &callee.returned_slot {
@@ -654,6 +677,10 @@ fn inline_helper_facts(
         }
 
         if gated.contains(&callee.id) {
+            facts.auth_symbols.extend(callee.recovered_vars.iter().cloned());
+            if let Some(recovered) = &call.recovered_into {
+                facts.auth_symbols.insert(recovered.clone());
+            }
             let callee_symbols = resolve_auth_symbols(callee, &callee.direct_auth_roots);
             for symbol in callee_symbols {
                 let mapped = substitutions.get(&symbol).cloned().unwrap_or(symbol);
@@ -797,6 +824,32 @@ fn write_advances_counter(write: &WriteFact, assignments: &HashMap<String, Strin
     }
 }
 
+/// A signed nonce kept by another contract and advanced through it, as in
+/// `nonceHolder.setNonce(token, tokenId, nonce + 1)` with `nonce` in the digest.
+fn has_external_nonce_update(source: &str, auth: &BTreeSet<String>) -> bool {
+    let mut from = 0;
+    while let Some(rel) = source[from..].find('.') {
+        let dot = from + rel;
+        let name: String = source[dot + 1..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        from = dot + 1;
+        let lower = name.to_ascii_lowercase();
+        let updates_nonce = lower.contains("nonce")
+            && ["set", "increment", "use", "invalidate", "bump", "increase"].iter().any(|p| lower.starts_with(p));
+        if !updates_nonce {
+            continue;
+        }
+        if let Some(args) = parse_call_args_at(source, dot) {
+            if args.iter().any(|arg| expr_is_authenticated(arg, auth)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn final_write_for_slot<'a>(writes: &'a [WriteFact], slot: &Slot) -> Option<&'a WriteFact> {
     writes.iter().rev().find(|write| same_slot(slot, &write.slot))
 }
@@ -841,7 +894,12 @@ fn digest_is_domain_bound(model: &FunctionModel, models: &BTreeMap<NodeID, Funct
                 let Some(name) = function_name(&callee.source) else {
                     continue;
                 };
-                if contains_word(&text, &name) {
+                // A helper that receives the signed value (`verifyEIP712(owner, structHash, v, r, s)`)
+                // may add the domain itself, so its body counts as part of the digest.
+                let receives_signed_value = call.args.iter().any(|arg| {
+                    model.direct_auth_roots.iter().any(|root| contains_word(arg, root))
+                });
+                if contains_word(&text, &name) || receives_signed_value {
                     text.push(' ');
                     text.push_str(&callee.source);
                     next.push(callee);
@@ -852,8 +910,9 @@ fn digest_is_domain_bound(model: &FunctionModel, models: &BTreeMap<NodeID, Funct
     }
     let lower = compact(&text).to_ascii_lowercase();
     [
+        // The contract itself: a digest with only the chain id is valid on every deployment that
+        // trusts the same signer on that chain.
         "address(this)",
-        "chainid",
         "domainseparator",
         "domain_separator",
         "_hashtypeddata",
@@ -964,20 +1023,63 @@ fn collect_guards(source: &str, excluded_scalars: &[String]) -> Vec<GuardFact> {
                 break;
             };
             let raw_condition = &source[open + 1..close];
-            let condition = if keyword == "if" {
-                raw_condition.trim().to_string()
+            let conditions = if keyword == "if" {
+                // `if (cond) revert ..;` is `require(!cond)`.
+                if super::signature_utils::body_reverts(&source[close + 1..]) {
+                    negated_atoms(raw_condition)
+                } else {
+                    vec![raw_condition.trim().to_string()]
+                }
             } else {
-                split_top_level(raw_condition, ',')
+                vec![split_top_level(raw_condition, ',')
                     .into_iter()
                     .next()
-                    .unwrap_or_default()
+                    .unwrap_or_default()]
             };
-            if let Some(fact) = parse_guard(&condition, pos, excluded_scalars) {
-                out.push(fact);
+            for condition in conditions {
+                if let Some(fact) = parse_guard(&condition, pos, excluded_scalars) {
+                    out.push(fact);
+                }
             }
             from = close + 1;
         }
     }
+    out
+}
+
+/// The conditions that must hold when `cond` is false: `a || b` gives `!a` and `!b`; a comparison is
+/// inverted; anything else is wrapped in `!`. A top-level `&&` gives no usable guard.
+fn negated_atoms(condition: &str) -> Vec<String> {
+    let condition = condition.trim();
+    if find_top_level_operator(condition, "&&").is_some() {
+        return Vec::new();
+    }
+    let atoms = split_top_level_or(condition);
+    atoms
+        .iter()
+        .map(|atom| {
+            let atom = atom.trim();
+            for (op, inverse) in [("!=", "=="), ("==", "!="), (">=", "<"), ("<=", ">"), (">", "<="), ("<", ">=")] {
+                if let Some(idx) = find_top_level_operator(atom, op) {
+                    return format!("{} {inverse} {}", &atom[..idx], &atom[idx + op.len()..]);
+                }
+            }
+            match atom.strip_prefix('!') {
+                Some(inner) => inner.trim().to_string(),
+                None => format!("!{atom}"),
+            }
+        })
+        .collect()
+}
+
+fn split_top_level_or(condition: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = condition;
+    while let Some(idx) = find_top_level_operator(rest, "||") {
+        out.push(rest[..idx].to_string());
+        rest = &rest[idx + 2..];
+    }
+    out.push(rest.to_string());
     out
 }
 
@@ -1078,10 +1180,9 @@ fn collect_writes(source: &str) -> Vec<WriteFact> {
                     out.push(WriteFact {
                         slot,
                         op,
-                        rhs: s[idx + operator.len()..]
-                            .trim()
-                            .trim_end_matches(';')
-                            .to_string(),
+                        rhs: super::signature_utils::desugar_safemath(
+                            s[idx + operator.len()..].trim().trim_end_matches(';'),
+                        ),
                         pos,
                         conditional: is_inside_conditional_block(source, pos),
                     });
@@ -1127,8 +1228,54 @@ fn collect_writes(source: &str) -> Vec<WriteFact> {
 
 /// A write through a local storage pointer, e.g. `Counters.Counter storage nonce = _nonces[owner];
 /// nonce.increment();`, is a write to the slot the pointer refers to.
+/// `Receipt storage receipt = proposal.receipts[voter]` makes `receipt.hasVoted` the location
+/// `proposals[proposalId].receipts[voter].hasVoted`. Only slots with a field are resolved this way:
+/// a value type has no fields, so the alias is a storage pointer.
+fn resolve_member_alias(slot: &Slot, assignments: &HashMap<String, String>) -> Slot {
+    let mut slot = slot.clone();
+    for _ in 0..4 {
+        if !slot.keys.first().is_some_and(|key| key.starts_with('.')) {
+            break;
+        }
+        let Some(rhs) = assignments.get(&slot.base) else {
+            break;
+        };
+        if !rhs_is_plain_location(rhs) {
+            break;
+        }
+        let Some(target) = parse_slot(rhs) else {
+            break;
+        };
+        let mut keys = target.keys.clone();
+        keys.extend(slot.keys);
+        slot = Slot { base: target.base, keys };
+    }
+    slot
+}
+
+/// The right-hand side is a storage location only (identifiers, `[..]` indices and `.field`s).
+fn rhs_is_plain_location(rhs: &str) -> bool {
+    let mut depth = 0i32;
+    for ch in rhs.trim().chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            '(' | '+' | '-' | '*' | '/' | '?' | ',' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn resolve_guard_aliases(guards: &mut [GuardFact], assignments: &HashMap<String, String>) {
+    for guard in guards {
+        guard.slot = resolve_member_alias(&guard.slot, assignments);
+    }
+}
+
 fn resolve_storage_aliases(writes: &mut [WriteFact], assignments: &HashMap<String, String>) {
     for write in writes {
+        write.slot = resolve_member_alias(&write.slot, assignments);
         if !write.slot.keys.is_empty() {
             continue;
         }
@@ -1156,7 +1303,7 @@ fn parse_lvalue(text: &str) -> Option<Slot> {
     if let Some(cut) = cut {
         text = text[cut + 1..].trim();
     }
-    if text.contains('[') {
+    if text.contains('[') || text.contains('.') {
         return parse_slot(text);
     }
     let base = last_identifier(text)?;
@@ -1187,6 +1334,21 @@ fn parse_slot(text: &str) -> Option<Slot> {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
+        if i < bytes.len() && bytes[i] == b'.' {
+            // A struct field (`receipt.hasVoted`) is part of the location; a member call
+            // (`nonces[a].current()`) ends it.
+            let mut end = i + 1;
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            let rest = text[end..].trim_start();
+            if end == i + 1 || rest.starts_with('(') {
+                break;
+            }
+            keys.push(format!(".{}", &text[i + 1..end]));
+            i = end;
+            continue;
+        }
         if i >= bytes.len() || bytes[i] != b'[' {
             break;
         }
@@ -1203,6 +1365,9 @@ fn parse_slot(text: &str) -> Option<Slot> {
 }
 
 fn digest_argument_at(source: &str, pos: usize, sink_name: &str) -> Option<String> {
+    if matches!(sink_name, "recover" | "tryRecover") {
+        return super::signature_utils::member_recovery_digest(source, pos, sink_name);
+    }
     let args = parse_call_args_at(source, pos)?;
     // `isValidSignatureNow(signer, hash, sig)` and external verifiers `isValid(signer, digest, sig)`
     // take the digest second; recover/tryRecover/isValidSignature take it first.
@@ -1306,13 +1471,6 @@ fn has_reverting_external_flow(source: &str) -> bool {
     has_later_revert
 }
 
-fn first_external_effect_position(source: &str) -> Option<usize> {
-    [".call(", ".delegatecall(", "try "]
-        .iter()
-        .filter_map(|needle| source.find(needle))
-        .min()
-}
-
 fn call_condition_context(source: &str, pos: usize) -> (bool, bool) {
     for keyword in ["require", "assert", "if"] {
         let mut from = 0;
@@ -1334,32 +1492,7 @@ fn call_condition_context(source: &str, pos: usize) -> (bool, bool) {
 }
 
 fn is_inside_conditional_block(source: &str, pos: usize) -> bool {
-    let prefix = &source[..pos.min(source.len())];
-    let mut search_from = 0;
-    while let Some(if_pos) = find_word_from(prefix, "if", search_from) {
-        let Some(open_paren) = prefix[if_pos + 2..].find('(').map(|x| if_pos + 2 + x) else {
-            break;
-        };
-        let Some(close_paren) = matching_delimiter(prefix, open_paren, '(', ')') else {
-            break;
-        };
-        let Some(open_brace_rel) = source[close_paren + 1..].find('{') else {
-            search_from = close_paren + 1;
-            continue;
-        };
-        let open_brace = close_paren + 1 + open_brace_rel;
-        if open_brace >= pos {
-            search_from = close_paren + 1;
-            continue;
-        }
-        if let Some(close_brace) = matching_delimiter(source, open_brace, '{', '}') {
-            if pos > open_brace && pos < close_brace {
-                return true;
-            }
-        }
-        search_from = close_paren + 1;
-    }
-    false
+    super::signature_utils::inside_conditional_body(source, pos)
 }
 
 fn split_statements(source: &str) -> Vec<String> {
@@ -1718,10 +1851,10 @@ mod signature_replay_tests {
     }
 
     #[test]
-    fn detects_replay_state_rollback() {
+    fn accepts_rollback_with_reverting_call() {
         assert_eq!(
             run("../tests/contract-playground/src/signature-replay/SignatureReplayRollback.sol"),
-            1
+            0
         );
     }
 
@@ -1763,5 +1896,65 @@ mod signature_replay_tests {
             run("../tests/contract-playground/src/signature-replay/SignatureReplayExternalVerifierSafe.sol"),
             0
         );
+    }
+
+    #[test]
+    fn accepts_compound_delegate_by_sig() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/CompoundDelegate.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_vote_once_through_storage_pointer() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/GovernorVote.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_meta_transaction_with_reverting_call() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/MaticMetaTx.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_safemath_nonce_after_comment() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/MetaTxSafeMathComment.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_signature_in_two_encodings() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/AnyswapPermit.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_solmate_permit_in_unchecked_block() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/SolmatePermit.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_revert_guards_on_recovered_signer() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/RevertGuardDelegate.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_nonce_compared_with_use_nonce() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/VotesUseNonce.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_external_nonce_registry() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/ExternalNonceRegistry.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_bound_recover_digest_with_domain() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/BoundRecoverDomain.sol"), 0);
+    }
+
+    #[test]
+    fn detects_digest_bound_to_chain_only() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/ChainOnlyDigest.sol"), 1);
+    }
+
+    #[test]
+    fn handles_multibyte_characters() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/UnicodeStrings.sol"), 0);
     }
 }

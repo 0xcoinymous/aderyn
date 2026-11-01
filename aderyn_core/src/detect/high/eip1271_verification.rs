@@ -28,6 +28,8 @@ pub struct EIP1271VerificationDetector {
 
 const MAX_CALL_DEPTH: usize = 5;
 const ERC1271_MAGIC: &str = "0x1626ba7e";
+/// Magic value of the legacy interface isValidSignature(bytes,bytes).
+const ERC1271_LEGACY_MAGIC: &str = "0x20c13b0b";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SrcSpan {
@@ -145,7 +147,7 @@ impl IssueDetector for EIP1271VerificationDetector {
                 continue;
             }
 
-            let bad_shape = !is_canonical_erc1271_shape(&model.sig);
+            let bad_shape = !is_canonical_erc1271_shape(&model.sig) && !is_legacy_erc1271(model);
             let bad_state = implementation_changes_state(model.id, &models, MAX_CALL_DEPTH);
             let bad_inputs = if bad_shape {
                 false
@@ -286,7 +288,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
         let Some(function) = context.function_definitions().into_iter().find(|f| f.id == caller) else {
             continue;
         };
-        let source = function.peek(context).unwrap_or_default();
+        let source = super::signature_utils::blank_comments(&function.peek(context).unwrap_or_default());
         let local_pos = node_span.start.saturating_sub(fspan.start);
         let args = parse_call_args_at(&source, local_pos).unwrap_or_default();
         call_sites_by_function
@@ -311,7 +313,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
 
     let mut models = BTreeMap::new();
     for function in context.function_definitions() {
-        let source = function.peek(context).unwrap_or_default();
+        let source = super::signature_utils::blank_comments(&function.peek(context).unwrap_or_default());
         let sig = parse_function_signature(&source);
         let assignments = collect_assignments(&source);
         models.insert(
@@ -338,8 +340,26 @@ fn enclosing_function(node: SrcSpan, functions: &[(NodeID, SrcSpan)]) -> Option<
         .copied()
 }
 
+/// A wallet-side isValidSignature returns the bytes4 magic value; a helper with the same name that
+/// returns bool (e.g. isValidSignature(signer, hash, v, r, s)) is plain ECDSA, not ERC-1271.
 fn is_erc1271_implementation(model: &FunctionModel) -> bool {
-    model.sig.has_body && model.sig.name == "isValidSignature"
+    model.sig.has_body
+        && model.sig.name == "isValidSignature"
+        && model.sig.returns.len() == 1
+        && normalize_type(&model.sig.returns[0]) == "bytes4"
+}
+
+/// The legacy interface isValidSignature(bytes _data, bytes _signature) returns 0x20c13b0b. It is
+/// wrong only when it answers with the current magic value, which callers of the legacy selector
+/// never accept.
+fn is_legacy_erc1271(model: &FunctionModel) -> bool {
+    let sig = &model.sig;
+    sig.params.len() == 2
+        && normalize_type(&sig.params[0].ty) == "bytes"
+        && normalize_type(&sig.params[1].ty) == "bytes"
+        && sig.returns.len() == 1
+        && normalize_type(&sig.returns[0]) == "bytes4"
+        && !model.source.to_ascii_lowercase().contains(ERC1271_MAGIC)
 }
 
 fn is_canonical_erc1271_shape(sig: &FunctionSignature) -> bool {
@@ -961,8 +981,9 @@ fn direct_call_result_variable(source: &str, call: &ParsedCall) -> Option<String
 fn has_exact_magic_comparison_for_var(source: &str, var: &str) -> bool {
     let c = compact(source).to_ascii_lowercase();
     let v = compact(var).to_ascii_lowercase();
-    if c.contains(&format!("{}=={}", v, ERC1271_MAGIC))
-        || c.contains(&format!("{}=={}", ERC1271_MAGIC, v))
+    if [ERC1271_MAGIC, ERC1271_LEGACY_MAGIC]
+        .iter()
+        .any(|magic| c.contains(&format!("{v}=={magic}")) || c.contains(&format!("{magic}=={v}")))
     {
         return true;
     }
@@ -976,7 +997,8 @@ fn has_exact_magic_comparison_for_var(source: &str, var: &str) -> bool {
 
 fn caller_eoa_contract_branch_bad(model: &FunctionModel) -> bool {
     let compacted = compact(&model.source);
-    if !compacted.contains(".code.length") {
+    // `if (to.code.length == 0) return true;` in an ERC-721/1155 receiver check is not signature logic.
+    if !compacted.contains(".code.length") || !compacted.contains("isValidSignature") {
         return false;
     }
 
@@ -1345,6 +1367,7 @@ fn last_operand(text: &str) -> &str {
 fn magic_operand(operand: &str) -> bool {
     let operand = operand.trim_matches(|ch: char| ch == '(' || ch == ')');
     operand.contains(ERC1271_MAGIC)
+        || operand.contains(ERC1271_LEGACY_MAGIC)
         || operand.ends_with("isvalidsignature.selector")
         || identifier_sequence(operand)
             .iter()
@@ -1352,18 +1375,13 @@ fn magic_operand(operand: &str) -> bool {
 }
 
 fn source_has_magic(source: &str) -> bool {
-    source.to_ascii_lowercase().contains(ERC1271_MAGIC) || contains_magic_identifier(source)
+    let lower = source.to_ascii_lowercase();
+    lower.contains(ERC1271_MAGIC) || lower.contains(ERC1271_LEGACY_MAGIC) || contains_magic_identifier(source)
 }
 
 fn contains_magic_identifier(source: &str) -> bool {
-    identifier_sequence(source).iter().any(|id| {
-        let x = id.to_ascii_lowercase();
-        x == "magic"
-            || x == "magicvalue"
-            || x == "magic_value"
-            || x.contains("erc1271_magic")
-            || x.contains("eip1271_magic")
-    })
+    // `MAGIC_VALUE`, `_ERC_1271_MAGIC_VALUE`, `LEGACY_MAGIC_VALUE`, ...
+    identifier_sequence(source).iter().any(|id| id.to_ascii_lowercase().contains("magic"))
 }
 
 #[derive(Debug, Clone)]
@@ -1535,15 +1553,9 @@ fn split_ternary(expr: &str) -> Option<(&str, &str, &str)> {
 fn is_magic_expr(expr: &str) -> bool {
     let c = compact(expr).to_ascii_lowercase();
     c.contains(ERC1271_MAGIC)
+        || c.contains(ERC1271_LEGACY_MAGIC)
         || c.contains("isvalidsignature.selector")
-        || identifier_sequence(expr).iter().any(|id| {
-            let x = id.to_ascii_lowercase();
-            x == "magic"
-                || x == "magicvalue"
-                || x == "magic_value"
-                || x.contains("erc1271_magic")
-                || x.contains("eip1271_magic")
-        })
+        || contains_magic_identifier(expr)
 }
 
 fn expr_depends_on_aliases(
@@ -2281,6 +2293,21 @@ mod eip1271_verification_tests {
             run("../tests/contract-playground/src/eip1271-verification/SafeEOAContractBranch.sol"),
             0
         );
+    }
+
+    #[test]
+    fn ignores_bool_ecdsa_helper_named_is_valid_signature() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/PlainEcdsaHelper.sol"), 0);
+    }
+
+    #[test]
+    fn ignores_erc721_receiver_check() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/ReceiverCheck.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_legacy_interface_with_legacy_magic() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/LegacyErc1271Wallet.sol"), 0);
     }
 }
 

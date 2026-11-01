@@ -237,7 +237,7 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
     let mut functions_by_file_and_name: HashMap<(usize, String), Vec<NodeID>> = HashMap::new();
     let mut source_by_id: HashMap<NodeID, String> = HashMap::new();
     for function in context.function_definitions() {
-        let source = function.peek(context).unwrap_or_default();
+        let source = super::signature_utils::blank_comments(&function.peek(context).unwrap_or_default());
         if let Some(name) = function_name(&source) {
             functions_by_name.entry(name.clone()).or_default().push(function.id);
             if let Some(span) = span_by_id.get(&function.id) {
