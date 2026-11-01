@@ -2424,7 +2424,7 @@ Making a `delegatecall` to an arbitrary address without any checks is dangerous.
 
 An EIP-712 signature-authorized operation constructs its signing domain, structured data hash, final typed-data digest, or runtime authorization boundary incorrectly. EIP-712 requires hashStruct(message) = keccak256(typeHash || encodeData(message)) and the final digest keccak256(\"\x19\x01\" || domainSeparator || structHash). Dynamic string/bytes members and arrays/nested structs require their EIP-712-specific hashed representation. Domain fields are optional, so absence of chainId or verifyingContract alone is not reported; however attacker-controlled domain material, inconsistent domain field encoding, stale chain-dependent caches, or an incorrect verifying-contract value can invalidate the intended domain separation. Finally, every security-sensitive runtime value controlled by the signed operation should be committed to the signed typed data. Use a reviewed EIP-712 domain/final-hash implementation, keep TYPEHASH definitions synchronized with encodeData, hash dynamic/reference members per EIP-712, and bind all execution-critical parameters to the signed struct.
 
-<details><summary>144 Found Instances</summary>
+<details><summary>139 Found Instances</summary>
 
 
 - Found in contracts/E712_S1_012_ImmutableVersion.sol [Line: 14](signature-security-benchmark/contracts/E712_S1_012_ImmutableVersion.sol#L14)
@@ -2529,37 +2529,7 @@ An EIP-712 signature-authorized operation constructs its signing domain, structu
 	    function execute(address signer, address recipient, address token, address target, uint256 amount, bytes32 actionId, bytes32 authId, bytes calldata callData, uint8 v, bytes32 r, bytes32 s, uint256 nonce, uint256 deadline) external {
 	```
 
-- Found in contracts/E712_S3_001_DirectPacked.sol [Line: 14](signature-security-benchmark/contracts/E712_S3_001_DirectPacked.sol#L14)
-
-	```solidity
-	    function execute(address signer, address recipient, address token, address target, uint256 amount, bytes32 actionId, bytes32 authId, bytes calldata callData, uint8 v, bytes32 r, bytes32 s) external {
-	```
-
-- Found in contracts/E712_S3_002_Bytes2Packed.sol [Line: 14](signature-security-benchmark/contracts/E712_S3_002_Bytes2Packed.sol#L14)
-
-	```solidity
-	    function execute(address signer, address recipient, address token, address target, uint256 amount, bytes32 actionId, bytes32 authId, bytes calldata callData, uint8 v, bytes32 r, bytes32 s) external {
-	```
-
-- Found in contracts/E712_S3_004_InternalHashTyped.sol [Line: 15](signature-security-benchmark/contracts/E712_S3_004_InternalHashTyped.sol#L15)
-
-	```solidity
-	    function execute(address signer, address recipient, address token, address target, uint256 amount, bytes32 actionId, bytes32 authId, bytes calldata callData, uint8 v, bytes32 r, bytes32 s) external {
-	```
-
-- Found in contracts/E712_S3_006_InheritedHashTyped.sol [Line: 15](signature-security-benchmark/contracts/E712_S3_006_InheritedHashTyped.sol#L15)
-
-	```solidity
-	    function execute(address signer, address recipient, address token, address target, uint256 amount, bytes32 actionId, bytes32 authId, bytes calldata callData, uint8 v, bytes32 r, bytes32 s) external {
-	```
-
 - Found in contracts/E712_S3_007_LocalPrefix.sol [Line: 14](signature-security-benchmark/contracts/E712_S3_007_LocalPrefix.sol#L14)
-
-	```solidity
-	    function execute(address signer, address recipient, address token, address target, uint256 amount, bytes32 actionId, bytes32 authId, bytes calldata callData, uint8 v, bytes32 r, bytes32 s) external {
-	```
-
-- Found in contracts/E712_S3_008_DomainHelper.sol [Line: 15](signature-security-benchmark/contracts/E712_S3_008_DomainHelper.sol#L15)
 
 	```solidity
 	    function execute(address signer, address recipient, address token, address target, uint256 amount, bytes32 actionId, bytes32 authId, bytes calldata callData, uint8 v, bytes32 r, bytes32 s) external {
@@ -3299,154 +3269,10 @@ An EIP-712 signature-authorized operation constructs its signing domain, structu
 
 ERC-1271 validation is implemented or consumed unsafely. A valid contract signature requires successful execution of isValidSignature(bytes32,bytes), the exact ERC-1271 magic value 0x1626ba7e, meaningful dependence on both the supplied hash and signature, and an independently authorized signer identity. Implementations must not mutate state. When using low-level calls, require call success before interpreting return data and reject malformed/short responses. Avoid permissive EOA/contract fallbacks and attacker-controlled validation contracts; prefer well-reviewed SignatureChecker-style helpers where appropriate.
 
-<details><summary>179 Found Instances</summary>
+<details><summary>154 Found Instances</summary>
 
 
-- Found in contracts/E1271_S1_005_SafeDirectInterfaceInline.sol [Line: 12](signature-security-benchmark/contracts/E1271_S1_005_SafeDirectInterfaceInline.sol#L12)
-
-	```solidity
-	    function _check(address signer, bytes32 hash, bytes calldata signature) internal view returns (bool) {
-	```
-
-- Found in contracts/E1271_S1_006_SafeDirectInterfaceOneLevelHelper.sol [Line: 12](signature-security-benchmark/contracts/E1271_S1_006_SafeDirectInterfaceOneLevelHelper.sol#L12)
-
-	```solidity
-	    function _inner(address signer, bytes32 hash, bytes calldata signature) internal view returns (bool) {
-	```
-
-- Found in contracts/E1271_S1_007_SafeDirectInterfaceTwoLevelHelper.sol [Line: 12](signature-security-benchmark/contracts/E1271_S1_007_SafeDirectInterfaceTwoLevelHelper.sol#L12)
-
-	```solidity
-	    function _leaf(address signer, bytes32 hash, bytes calldata signature) private view returns (bool) {
-	```
-
-- Found in contracts/E1271_S1_008_SafeDirectInterfaceBranchWrapper.sol [Line: 12](signature-security-benchmark/contracts/E1271_S1_008_SafeDirectInterfaceBranchWrapper.sol#L12)
-
-	```solidity
-	    function validate(address signer, bytes32 hash, bytes calldata signature) public view returns (bool) {
-	```
-
-- Found in contracts/E1271_S2_002_SafeOwnerRecoverOneLevelHelper.sol [Line: 16](signature-security-benchmark/contracts/E1271_S2_002_SafeOwnerRecoverOneLevelHelper.sol#L16)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S2_003_SafeOwnerRecoverTwoLevelHelper.sol [Line: 20](signature-security-benchmark/contracts/E1271_S2_003_SafeOwnerRecoverTwoLevelHelper.sol#L20)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S2_004_SafeOwnerRecoverBranchWrapper.sol [Line: 16](signature-security-benchmark/contracts/E1271_S2_004_SafeOwnerRecoverBranchWrapper.sol#L16)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S2_006_SafeHashPolicyAndSignatureOneLevelHelper.sol [Line: 20](signature-security-benchmark/contracts/E1271_S2_006_SafeHashPolicyAndSignatureOneLevelHelper.sol#L20)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S2_007_SafeHashPolicyAndSignatureTwoLevelHelper.sol [Line: 24](signature-security-benchmark/contracts/E1271_S2_007_SafeHashPolicyAndSignatureTwoLevelHelper.sol#L24)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S2_008_SafeHashPolicyAndSignatureBranchWrapper.sol [Line: 20](signature-security-benchmark/contracts/E1271_S2_008_SafeHashPolicyAndSignatureBranchWrapper.sol#L20)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S2_010_SafeExternalViewVerifierOneLevelHelper.sol [Line: 17](signature-security-benchmark/contracts/E1271_S2_010_SafeExternalViewVerifierOneLevelHelper.sol#L17)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S2_011_SafeExternalViewVerifierTwoLevelHelper.sol [Line: 21](signature-security-benchmark/contracts/E1271_S2_011_SafeExternalViewVerifierTwoLevelHelper.sol#L21)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S2_012_SafeExternalViewVerifierBranchWrapper.sol [Line: 17](signature-security-benchmark/contracts/E1271_S2_012_SafeExternalViewVerifierBranchWrapper.sol#L17)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S2_014_SafeReadOnlyRevocationOneLevelHelper.sol [Line: 20](signature-security-benchmark/contracts/E1271_S2_014_SafeReadOnlyRevocationOneLevelHelper.sol#L20)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S2_015_SafeReadOnlyRevocationTwoLevelHelper.sol [Line: 24](signature-security-benchmark/contracts/E1271_S2_015_SafeReadOnlyRevocationTwoLevelHelper.sol#L24)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S2_016_SafeReadOnlyRevocationBranchWrapper.sol [Line: 20](signature-security-benchmark/contracts/E1271_S2_016_SafeReadOnlyRevocationBranchWrapper.sol#L20)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S4_002_SafeCrossAccountRehashOneLevelHelper.sol [Line: 17](signature-security-benchmark/contracts/E1271_S4_002_SafeCrossAccountRehashOneLevelHelper.sol#L17)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S4_003_SafeCrossAccountRehashTwoLevelHelper.sol [Line: 21](signature-security-benchmark/contracts/E1271_S4_003_SafeCrossAccountRehashTwoLevelHelper.sol#L21)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S4_004_SafeCrossAccountRehashBranchWrapper.sol [Line: 17](signature-security-benchmark/contracts/E1271_S4_004_SafeCrossAccountRehashBranchWrapper.sol#L17)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S4_006_SafeERC7739SupportDetectionOneLevelHelper.sol [Line: 19](signature-security-benchmark/contracts/E1271_S4_006_SafeERC7739SupportDetectionOneLevelHelper.sol#L19)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S4_007_SafeERC7739SupportDetectionTwoLevelHelper.sol [Line: 23](signature-security-benchmark/contracts/E1271_S4_007_SafeERC7739SupportDetectionTwoLevelHelper.sol#L23)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S4_008_SafeERC7739SupportDetectionBranchWrapper.sol [Line: 19](signature-security-benchmark/contracts/E1271_S4_008_SafeERC7739SupportDetectionBranchWrapper.sol#L19)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S4_010_SafeMutableOwnerPolicyOneLevelHelper.sol [Line: 17](signature-security-benchmark/contracts/E1271_S4_010_SafeMutableOwnerPolicyOneLevelHelper.sol#L17)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S4_011_SafeMutableOwnerPolicyTwoLevelHelper.sol [Line: 21](signature-security-benchmark/contracts/E1271_S4_011_SafeMutableOwnerPolicyTwoLevelHelper.sol#L21)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_S4_012_SafeMutableOwnerPolicyBranchWrapper.sol [Line: 17](signature-security-benchmark/contracts/E1271_S4_012_SafeMutableOwnerPolicyBranchWrapper.sol#L17)
+- Found in contracts/E1271_S4_001_SafeCrossAccountRehashInline.sol [Line: 11](signature-security-benchmark/contracts/E1271_S4_001_SafeCrossAccountRehashInline.sol#L11)
 
 	```solidity
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
@@ -3668,6 +3494,12 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
 	```
 
+- Found in contracts/E1271_V2_001_UnconditionalMagicInline.sol [Line: 11](signature-security-benchmark/contracts/E1271_V2_001_UnconditionalMagicInline.sol#L11)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
+	```
+
 - Found in contracts/E1271_V2_002_UnconditionalMagicOneLevelHelper.sol [Line: 16](signature-security-benchmark/contracts/E1271_V2_002_UnconditionalMagicOneLevelHelper.sol#L16)
 
 	```solidity
@@ -3686,19 +3518,13 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
 	```
 
-- Found in contracts/E1271_V2_006_HardcodedDigestOneLevelHelper.sol [Line: 18](signature-security-benchmark/contracts/E1271_V2_006_HardcodedDigestOneLevelHelper.sol#L18)
+- Found in contracts/E1271_V2_005_HardcodedDigestInline.sol [Line: 12](signature-security-benchmark/contracts/E1271_V2_005_HardcodedDigestInline.sol#L12)
 
 	```solidity
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
 	```
 
-- Found in contracts/E1271_V2_007_HardcodedDigestTwoLevelHelper.sol [Line: 22](signature-security-benchmark/contracts/E1271_V2_007_HardcodedDigestTwoLevelHelper.sol#L22)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_V2_008_HardcodedDigestBranchWrapper.sol [Line: 18](signature-security-benchmark/contracts/E1271_V2_008_HardcodedDigestBranchWrapper.sol#L18)
+- Found in contracts/E1271_V2_009_SignatureIgnoredHashAllowlistInline.sol [Line: 14](signature-security-benchmark/contracts/E1271_V2_009_SignatureIgnoredHashAllowlistInline.sol#L14)
 
 	```solidity
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
@@ -3722,6 +3548,12 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
 	```
 
+- Found in contracts/E1271_V2_013_HashIgnoredSignatureAllowlistInline.sol [Line: 14](signature-security-benchmark/contracts/E1271_V2_013_HashIgnoredSignatureAllowlistInline.sol#L14)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
+	```
+
 - Found in contracts/E1271_V2_014_HashIgnoredSignatureAllowlistOneLevelHelper.sol [Line: 19](signature-security-benchmark/contracts/E1271_V2_014_HashIgnoredSignatureAllowlistOneLevelHelper.sol#L19)
 
 	```solidity
@@ -3740,6 +3572,12 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
 	```
 
+- Found in contracts/E1271_V2_017_TrustedCallerOnlyInline.sol [Line: 12](signature-security-benchmark/contracts/E1271_V2_017_TrustedCallerOnlyInline.sol#L12)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
+	```
+
 - Found in contracts/E1271_V2_018_TrustedCallerOnlyOneLevelHelper.sol [Line: 17](signature-security-benchmark/contracts/E1271_V2_018_TrustedCallerOnlyOneLevelHelper.sol#L17)
 
 	```solidity
@@ -3753,6 +3591,12 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	```
 
 - Found in contracts/E1271_V2_020_TrustedCallerOnlyBranchWrapper.sol [Line: 17](signature-security-benchmark/contracts/E1271_V2_020_TrustedCallerOnlyBranchWrapper.sol#L17)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
+	```
+
+- Found in contracts/E1271_V2_021_SignatureLengthOnlyInline.sol [Line: 11](signature-security-benchmark/contracts/E1271_V2_021_SignatureLengthOnlyInline.sol#L11)
 
 	```solidity
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
@@ -3795,6 +3639,12 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	```
 
 - Found in contracts/E1271_V2_028_HelperDropsHashBranchWrapper.sol [Line: 18](signature-security-benchmark/contracts/E1271_V2_028_HelperDropsHashBranchWrapper.sol#L18)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
+	```
+
+- Found in contracts/E1271_V2_029_HelperDropsSignatureInline.sol [Line: 15](signature-security-benchmark/contracts/E1271_V2_029_HelperDropsSignatureInline.sol#L15)
 
 	```solidity
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
@@ -3866,22 +3716,10 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function validate(address signer, bytes32 hash, bytes calldata signature) public view returns (bool) {
 	```
 
-- Found in contracts/E1271_V3_001_UserSuppliedSignerInline.sol [Line: 9](signature-security-benchmark/contracts/E1271_V3_001_UserSuppliedSignerInline.sol#L9)
-
-	```solidity
-	    function _check(address signer, bytes32 hash, bytes calldata signature) internal view returns (bool) {
-	```
-
 - Found in contracts/E1271_V3_001_UserSuppliedSignerInline.sol [Line: 14](signature-security-benchmark/contracts/E1271_V3_001_UserSuppliedSignerInline.sol#L14)
 
 	```solidity
 	    function execute(address signer, bytes32 hash, bytes calldata signature) external returns (bool) {
-	```
-
-- Found in contracts/E1271_V3_002_UserSuppliedSignerOneLevelHelper.sol [Line: 9](signature-security-benchmark/contracts/E1271_V3_002_UserSuppliedSignerOneLevelHelper.sol#L9)
-
-	```solidity
-	    function _inner(address signer, bytes32 hash, bytes calldata signature) internal view returns (bool) {
 	```
 
 - Found in contracts/E1271_V3_002_UserSuppliedSignerOneLevelHelper.sol [Line: 18](signature-security-benchmark/contracts/E1271_V3_002_UserSuppliedSignerOneLevelHelper.sol#L18)
@@ -3890,22 +3728,10 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function execute(address signer, bytes32 hash, bytes calldata signature) external returns (bool) {
 	```
 
-- Found in contracts/E1271_V3_003_UserSuppliedSignerTwoLevelHelper.sol [Line: 9](signature-security-benchmark/contracts/E1271_V3_003_UserSuppliedSignerTwoLevelHelper.sol#L9)
-
-	```solidity
-	    function _leaf(address signer, bytes32 hash, bytes calldata signature) private view returns (bool) {
-	```
-
 - Found in contracts/E1271_V3_003_UserSuppliedSignerTwoLevelHelper.sol [Line: 19](signature-security-benchmark/contracts/E1271_V3_003_UserSuppliedSignerTwoLevelHelper.sol#L19)
 
 	```solidity
 	    function execute(address signer, bytes32 hash, bytes calldata signature) external returns (bool) {
-	```
-
-- Found in contracts/E1271_V3_004_UserSuppliedSignerBranchWrapper.sol [Line: 9](signature-security-benchmark/contracts/E1271_V3_004_UserSuppliedSignerBranchWrapper.sol#L9)
-
-	```solidity
-	    function validate(address signer, bytes32 hash, bytes calldata signature) public view returns (bool) {
 	```
 
 - Found in contracts/E1271_V3_004_UserSuppliedSignerBranchWrapper.sol [Line: 14](signature-security-benchmark/contracts/E1271_V3_004_UserSuppliedSignerBranchWrapper.sol#L14)
@@ -3914,22 +3740,10 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function execute(address signer, bytes32 hash, bytes calldata signature) external returns (bool) {
 	```
 
-- Found in contracts/E1271_V3_005_UserSuppliedSignerPublicValidationWrapper.sol [Line: 9](signature-security-benchmark/contracts/E1271_V3_005_UserSuppliedSignerPublicValidationWrapper.sol#L9)
-
-	```solidity
-	    function _raw(address signer, bytes32 hash, bytes calldata signature) internal view returns (bool) {
-	```
-
 - Found in contracts/E1271_V3_005_UserSuppliedSignerPublicValidationWrapper.sol [Line: 18](signature-security-benchmark/contracts/E1271_V3_005_UserSuppliedSignerPublicValidationWrapper.sol#L18)
 
 	```solidity
 	    function execute(address signer, bytes32 hash, bytes calldata signature) external returns (bool) {
-	```
-
-- Found in contracts/E1271_V3_006_PubliclyMutableSignerInline.sol [Line: 13](signature-security-benchmark/contracts/E1271_V3_006_PubliclyMutableSignerInline.sol#L13)
-
-	```solidity
-	    function _check(address signer, bytes32 hash, bytes calldata signature) internal view returns (bool) {
 	```
 
 - Found in contracts/E1271_V3_006_PubliclyMutableSignerInline.sol [Line: 18](signature-security-benchmark/contracts/E1271_V3_006_PubliclyMutableSignerInline.sol#L18)
@@ -3938,22 +3752,10 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function execute(bytes32 hash, bytes calldata signature) external returns (bool) {
 	```
 
-- Found in contracts/E1271_V3_007_PubliclyMutableSignerOneLevelHelper.sol [Line: 13](signature-security-benchmark/contracts/E1271_V3_007_PubliclyMutableSignerOneLevelHelper.sol#L13)
-
-	```solidity
-	    function _inner(address signer, bytes32 hash, bytes calldata signature) internal view returns (bool) {
-	```
-
 - Found in contracts/E1271_V3_007_PubliclyMutableSignerOneLevelHelper.sol [Line: 22](signature-security-benchmark/contracts/E1271_V3_007_PubliclyMutableSignerOneLevelHelper.sol#L22)
 
 	```solidity
 	    function execute(bytes32 hash, bytes calldata signature) external returns (bool) {
-	```
-
-- Found in contracts/E1271_V3_008_PubliclyMutableSignerTwoLevelHelper.sol [Line: 13](signature-security-benchmark/contracts/E1271_V3_008_PubliclyMutableSignerTwoLevelHelper.sol#L13)
-
-	```solidity
-	    function _leaf(address signer, bytes32 hash, bytes calldata signature) private view returns (bool) {
 	```
 
 - Found in contracts/E1271_V3_008_PubliclyMutableSignerTwoLevelHelper.sol [Line: 23](signature-security-benchmark/contracts/E1271_V3_008_PubliclyMutableSignerTwoLevelHelper.sol#L23)
@@ -3962,22 +3764,10 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function execute(bytes32 hash, bytes calldata signature) external returns (bool) {
 	```
 
-- Found in contracts/E1271_V3_009_PubliclyMutableSignerBranchWrapper.sol [Line: 13](signature-security-benchmark/contracts/E1271_V3_009_PubliclyMutableSignerBranchWrapper.sol#L13)
-
-	```solidity
-	    function validate(address signer, bytes32 hash, bytes calldata signature) public view returns (bool) {
-	```
-
 - Found in contracts/E1271_V3_009_PubliclyMutableSignerBranchWrapper.sol [Line: 18](signature-security-benchmark/contracts/E1271_V3_009_PubliclyMutableSignerBranchWrapper.sol#L18)
 
 	```solidity
 	    function execute(bytes32 hash, bytes calldata signature) external returns (bool) {
-	```
-
-- Found in contracts/E1271_V3_010_PubliclyMutableSignerPublicValidationWrapper.sol [Line: 13](signature-security-benchmark/contracts/E1271_V3_010_PubliclyMutableSignerPublicValidationWrapper.sol#L13)
-
-	```solidity
-	    function _raw(address signer, bytes32 hash, bytes calldata signature) internal view returns (bool) {
 	```
 
 - Found in contracts/E1271_V3_010_PubliclyMutableSignerPublicValidationWrapper.sol [Line: 22](signature-security-benchmark/contracts/E1271_V3_010_PubliclyMutableSignerPublicValidationWrapper.sol#L22)
@@ -4076,24 +3866,6 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
 	```
 
-- Found in contracts/E1271_V3_027_SelfAuthorizingRegistryOneLevelHelper.sol [Line: 16](signature-security-benchmark/contracts/E1271_V3_027_SelfAuthorizingRegistryOneLevelHelper.sol#L16)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_V3_028_SelfAuthorizingRegistryTwoLevelHelper.sol [Line: 20](signature-security-benchmark/contracts/E1271_V3_028_SelfAuthorizingRegistryTwoLevelHelper.sol#L20)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
-- Found in contracts/E1271_V3_030_SelfAuthorizingRegistryPublicValidationWrapper.sol [Line: 16](signature-security-benchmark/contracts/E1271_V3_030_SelfAuthorizingRegistryPublicValidationWrapper.sol#L16)
-
-	```solidity
-	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
-	```
-
 - Found in contracts/E1271_V3_031_UnsafeOwnerFallbackInline.sol [Line: 12](signature-security-benchmark/contracts/E1271_V3_031_UnsafeOwnerFallbackInline.sol#L12)
 
 	```solidity
@@ -4154,6 +3926,12 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4) {
 	```
 
+- Found in contracts/E1271_V4_001_StateCounterMutationInline.sol [Line: 12](signature-security-benchmark/contracts/E1271_V4_001_StateCounterMutationInline.sol#L12)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external returns (bytes4) {
+	```
+
 - Found in contracts/E1271_V4_002_StateCounterMutationOneLevelHelper.sol [Line: 18](signature-security-benchmark/contracts/E1271_V4_002_StateCounterMutationOneLevelHelper.sol#L18)
 
 	```solidity
@@ -4167,6 +3945,18 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	```
 
 - Found in contracts/E1271_V4_004_StateCounterMutationBranchWrapper.sol [Line: 18](signature-security-benchmark/contracts/E1271_V4_004_StateCounterMutationBranchWrapper.sol#L18)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external returns (bytes4) {
+	```
+
+- Found in contracts/E1271_V4_005_StateCounterMutationPublicValidationWrapper.sol [Line: 18](signature-security-benchmark/contracts/E1271_V4_005_StateCounterMutationPublicValidationWrapper.sol#L18)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external returns (bytes4) {
+	```
+
+- Found in contracts/E1271_V4_006_LastHashMutationInline.sol [Line: 12](signature-security-benchmark/contracts/E1271_V4_006_LastHashMutationInline.sol#L12)
 
 	```solidity
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external returns (bytes4) {
@@ -4190,6 +3980,18 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external returns (bytes4) {
 	```
 
+- Found in contracts/E1271_V4_010_LastHashMutationPublicValidationWrapper.sol [Line: 18](signature-security-benchmark/contracts/E1271_V4_010_LastHashMutationPublicValidationWrapper.sol#L18)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external returns (bytes4) {
+	```
+
+- Found in contracts/E1271_V4_011_NonceConsumptionInsideValidationInline.sol [Line: 12](signature-security-benchmark/contracts/E1271_V4_011_NonceConsumptionInsideValidationInline.sol#L12)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external returns (bytes4) {
+	```
+
 - Found in contracts/E1271_V4_012_NonceConsumptionInsideValidationOneLevelHelper.sol [Line: 19](signature-security-benchmark/contracts/E1271_V4_012_NonceConsumptionInsideValidationOneLevelHelper.sol#L19)
 
 	```solidity
@@ -4203,6 +4005,12 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	```
 
 - Found in contracts/E1271_V4_014_NonceConsumptionInsideValidationBranchWrapper.sol [Line: 19](signature-security-benchmark/contracts/E1271_V4_014_NonceConsumptionInsideValidationBranchWrapper.sol#L19)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external returns (bytes4) {
+	```
+
+- Found in contracts/E1271_V4_015_NonceConsumptionInsideValidationPublicValidationWrapper.sol [Line: 19](signature-security-benchmark/contracts/E1271_V4_015_NonceConsumptionInsideValidationPublicValidationWrapper.sol#L19)
 
 	```solidity
 	    function isValidSignature(bytes32 hash, bytes calldata signature) external returns (bytes4) {
@@ -4328,6 +4136,18 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 	    function isValidSignature(bytes32 hash) external pure returns (bytes4) {
 	```
 
+- Found in contracts/E1271_V4_038_MutableValidationState3.sol [Line: 12](signature-security-benchmark/contracts/E1271_V4_038_MutableValidationState3.sol#L12)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external returns (bytes4) {
+	```
+
+- Found in contracts/E1271_V4_040_MutableValidationState5.sol [Line: 12](signature-security-benchmark/contracts/E1271_V4_040_MutableValidationState5.sol#L12)
+
+	```solidity
+	    function isValidSignature(bytes32 hash, bytes calldata signature) external returns (bytes4) {
+	```
+
 - Found in contracts/SR_A_004_GovernanceAdversarialSafeDigestRegistryNoNonce04.sol [Line: 12](signature-security-benchmark/contracts/SR_A_004_GovernanceAdversarialSafeDigestRegistryNoNonce04.sol#L12)
 
 	```solidity
@@ -4384,7 +4204,7 @@ ERC-1271 validation is implemented or consumed unsafely. A valid contract signat
 
 A signature-authorized operation uses persistent nonce, sequence, authorization, bitmap, cancellation, or equivalent one-time state incorrectly. The authorization value may be omitted from the signed digest, compared against the wrong or transient state, checked but not consumed, consumed in a different signer/namespace slot, made reversible by reset/decrease/bitmap-clearing logic, or rolled back by a later revert. Bind the authorization nonce and its namespace to the signed message, compare it against the intended persistent state, and irreversibly advance/consume the exact same storage slot. For unordered nonces, reject already-dirty bits before or atomically with setting them. Invalidation must be monotonic or one-way, and failure handling must not restore consumed authorization state unless replay is intentionally permitted.
 
-<details><summary>400 Found Instances</summary>
+<details><summary>401 Found Instances</summary>
 
 
 - Found in contracts/E1271_S1_002_SafeExactStaticcallOneLevelHelper.sol [Line: 21](signature-security-benchmark/contracts/E1271_S1_002_SafeExactStaticcallOneLevelHelper.sol#L21)
@@ -6041,6 +5861,12 @@ A signature-authorized operation uses persistent nonce, sequence, authorization,
 
 	```solidity
 	    function transferBySig(address actor, address recipient, uint256 amount, bytes32 actionId, bytes calldata signature) external {
+	```
+
+- Found in contracts/SM_V4_002_WithdrawalRawSignatureKey02.sol [Line: 12](signature-security-benchmark/contracts/SM_V4_002_WithdrawalRawSignatureKey02.sol#L12)
+
+	```solidity
+	    function withdrawBySig(address actor, address recipient, uint256 amount, bytes32 actionId, bytes calldata signature) external {
 	```
 
 - Found in contracts/SM_V4_003_VoucherMintRawSignatureKey03.sol [Line: 13](signature-security-benchmark/contracts/SM_V4_003_VoucherMintRawSignatureKey03.sol#L13)
@@ -9132,7 +8958,7 @@ A signature-authorized operation appears to lack an effective freshness invarian
 
 A signature-authenticated operation accepts a non-canonical ECDSA signature, performs permissive recovery-parity normalization, or treats a non-canonical serialized signature as the authorization/replay identity. ECDSA can admit equivalent representations unless the implementation enforces a lower-half-order s value and a single intended recovery-parity convention. When multiple encodings such as compact and traditional signatures are accepted, replay/uniqueness state must be keyed by the authenticated message, nonce, or authorization identifier rather than raw signature bytes. Use a reviewed canonical recovery implementation, reject high-s values, validate v/parity strictly, normalize accepted encodings before security-sensitive identity decisions, and never rely on keccak256(signature) or equivalent raw serialization as a unique authorization key.
 
-<details><summary>271 Found Instances</summary>
+<details><summary>272 Found Instances</summary>
 
 
 - Found in contracts/E1271_S1_013_SafeSignatureCheckerInline.sol [Line: 16](signature-security-benchmark/contracts/E1271_S1_013_SafeSignatureCheckerInline.sol#L16)
@@ -10023,6 +9849,12 @@ A signature-authenticated operation accepts a non-canonical ECDSA signature, per
 	    function transferBySig(address actor, address recipient, uint256 amount, bytes32 actionId, bytes calldata signature) external {
 	```
 
+- Found in contracts/SM_V4_002_WithdrawalRawSignatureKey02.sol [Line: 12](signature-security-benchmark/contracts/SM_V4_002_WithdrawalRawSignatureKey02.sol#L12)
+
+	```solidity
+	    function withdrawBySig(address actor, address recipient, uint256 amount, bytes32 actionId, bytes calldata signature) external {
+	```
+
 - Found in contracts/SM_V4_003_VoucherMintRawSignatureKey03.sol [Line: 13](signature-security-benchmark/contracts/SM_V4_003_VoucherMintRawSignatureKey03.sol#L13)
 
 	```solidity
@@ -10769,7 +10601,7 @@ A signature-authenticated operation accepts a non-canonical ECDSA signature, per
 
 A signature-authorized operation can remain valid after it should have been consumed, or its replay state is scoped more narrowly than the authenticated authorization. Repeated execution can duplicate withdrawals, claims, orders, approvals, bridge releases, meta-transactions, or other signed actions. Bind a unique nonce/authorization identifier (and any execution-domain discriminator) into the signed message, validate it against persistent state, and irreversibly invalidate the exact same state/key on successful execution. Do not rely on replay-state updates that are later rolled back by a revert; equivalent execution paths must share replay state or be cryptographically domain-separated.
 
-<details><summary>487 Found Instances</summary>
+<details><summary>488 Found Instances</summary>
 
 
 - Found in contracts/E1271_S1_001_SafeExactStaticcallInline.sol [Line: 17](signature-security-benchmark/contracts/E1271_S1_001_SafeExactStaticcallInline.sol#L17)
@@ -12644,6 +12476,12 @@ A signature-authorized operation can remain valid after it should have been cons
 	    function transferBySig(address actor, address recipient, uint256 amount, bytes32 actionId, bytes calldata signature) external {
 	```
 
+- Found in contracts/SM_V4_002_WithdrawalRawSignatureKey02.sol [Line: 12](signature-security-benchmark/contracts/SM_V4_002_WithdrawalRawSignatureKey02.sol#L12)
+
+	```solidity
+	    function withdrawBySig(address actor, address recipient, uint256 amount, bytes32 actionId, bytes calldata signature) external {
+	```
+
 - Found in contracts/SM_V4_003_VoucherMintRawSignatureKey03.sol [Line: 13](signature-security-benchmark/contracts/SM_V4_003_VoucherMintRawSignatureKey03.sol#L13)
 
 	```solidity
@@ -13704,7 +13542,7 @@ A signature-authorized operation can remain valid after it should have been cons
 
 The `ecrecover` function is susceptible to signature malleability. This means that the same message can be signed in multiple ways, allowing an attacker to change the message signature without invalidating it. This can lead to unexpected behavior in smart contracts, such as the loss of funds or the ability to bypass access control. Consider using OpenZeppelin's ECDSA library instead of the built-in function.
 
-<details><summary>182 Found Instances</summary>
+<details><summary>183 Found Instances</summary>
 
 
 - Found in contracts/E1271_BenchLib.sol [Line: 29](signature-security-benchmark/contracts/E1271_BenchLib.sol#L29)
@@ -14355,6 +14193,12 @@ The `ecrecover` function is susceptible to signature malleability. This means th
 	        require(ecrecover(digest, v, r, s) == authorizedSigner, "invalid signature");
 	```
 
+- Found in contracts/SM_V2_028_RefundPermissiveV28.sol [Line: 18](signature-security-benchmark/contracts/SM_V2_028_RefundPermissiveV28.sol#L18)
+
+	```solidity
+	        require(ecrecover(digest, v, r, s) == authorizedSigner, "invalid signature");
+	```
+
 - Found in contracts/SM_V2_029_TicketRedeemPermissiveV29.sol [Line: 18](signature-security-benchmark/contracts/SM_V2_029_TicketRedeemPermissiveV29.sol#L18)
 
 	```solidity
@@ -14487,10 +14331,10 @@ The `ecrecover` function is susceptible to signature malleability. This means th
 	        if (v < 27) v += 27; require(ecrecover(digest,v,r,s)==authorizedSigner,"invalid");
 	```
 
-- Found in contracts/SM_V4_002_WithdrawalRawSignatureKey02.sol [Line: 17](signature-security-benchmark/contracts/SM_V4_002_WithdrawalRawSignatureKey02.sol#L17)
+- Found in contracts/SM_V4_002_WithdrawalRawSignatureKey02.sol [Line: 18](signature-security-benchmark/contracts/SM_V4_002_WithdrawalRawSignatureKey02.sol#L18)
 
 	```solidity
-	        require(!consumedSignature[key], "signature used");
+	        require(ecrecover(digest,v,r,s)==authorizedSigner,"invalid");
 	```
 
 - Found in contracts/SM_V4_003_VoucherMintRawSignatureKey03.sol [Line: 20](signature-security-benchmark/contracts/SM_V4_003_VoucherMintRawSignatureKey03.sol#L20)
