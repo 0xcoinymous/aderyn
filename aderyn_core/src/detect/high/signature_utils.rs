@@ -375,6 +375,30 @@ pub(crate) fn split_statements(source: &str) -> Vec<String> {
     out
 }
 
+/// Splits a statement at block braces outside parentheses, so that `if (c) { x = a; } y = b`, a
+/// function header followed by its first statement, or an inline-assembly block followed by a
+/// declaration yields one piece per statement.
+pub(crate) fn block_pieces(statement: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for ch in statement.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '{' | '}' if depth == 0 => {
+                out.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(ch);
+    }
+    out.push(current);
+    out.retain(|piece| !piece.trim().is_empty());
+    out
+}
+
 pub(crate) fn split_top_level(text: &str, separator: char) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();

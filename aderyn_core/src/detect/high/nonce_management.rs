@@ -157,6 +157,8 @@ struct NonceAssessment {
     suspicious: bool,
     rollback_sensitive: bool,
     guarded_slots: Vec<StateSlot>,
+    /// Guarded slots checked to be unused (zero/false) before use: only clearing them revives a signature.
+    cleared_slots: Vec<StateSlot>,
 }
 
 impl IssueDetector for NonceManagementDetector {
@@ -607,6 +609,27 @@ fn principal_after_call(source: &str, pos: usize) -> Option<String> {
     }
 }
 
+/// The number of signatures one call to `callee` verifies: at most one per signature it receives (a
+/// `bytes` signature, or a `v, r, s` triple). OpenZeppelin's `ECDSA.recover(hash, sig)` has a recovery
+/// for 65-byte and one for 64-byte signatures, but verifies the one signature it is given; a helper
+/// that receives two signatures still counts two.
+fn signatures_per_call(callee: &FunctionModel, recoveries: usize) -> usize {
+    let types: Vec<String> = callee
+        .parameters
+        .iter()
+        .map(|p| identifier_sequence(&p.raw).first().cloned().unwrap_or_default())
+        .collect();
+    let byte_signatures = types.iter().filter(|ty| ty.as_str() == "bytes").count();
+    let triples = types.iter().filter(|ty| ty.as_str() == "uint8").count();
+    let has_arrays = callee.parameters.iter().any(|p| p.raw.contains('['));
+    let received = byte_signatures + triples;
+    if received == 0 || has_arrays {
+        recoveries
+    } else {
+        recoveries.min(received)
+    }
+}
+
 fn propagate_auth_summaries(models: &BTreeMap<NodeID, FunctionModel>) -> BTreeMap<NodeID, AuthSummary> {
     let mut summaries: BTreeMap<NodeID, AuthSummary> = models
         .iter()
@@ -642,7 +665,7 @@ fn propagate_auth_summaries(models: &BTreeMap<NodeID, FunctionModel>) -> BTreeMa
                 if !alternative {
                     next.signature_count = next
                         .signature_count
-                        .saturating_add(callee.signature_count)
+                        .saturating_add(signatures_per_call(callee_model, callee.signature_count))
                         .min(8);
                 }
                 previous_verifier_end = model.source.get(call.pos..).and_then(|tail| {
@@ -763,7 +786,7 @@ fn assess_entry_function(
     models: &BTreeMap<NodeID, FunctionModel>,
     helper_summaries: &BTreeMap<NodeID, StateHelperSummary>,
 ) -> NonceAssessment {
-    let auth = &with_digest_helper_returns(model, auth, models);
+    let auth = &with_sender_binding(model, &with_digest_helper_returns(model, auth, models));
     let locals = collect_local_names(&model.source, &model.parameters);
     let mut guards = collect_guards(
         model,
@@ -788,6 +811,7 @@ fn assess_entry_function(
 
     let mut effective = 0usize;
     let mut guarded_slots = Vec::new();
+    let mut cleared_slots: Vec<StateSlot> = Vec::new();
     let mut candidate_activity = false;
 
     if xor_postcondition
@@ -801,13 +825,24 @@ fn assess_entry_function(
     }
 
     for guard in &mut guards {
-        if slot_has_nonce_semantic_hint(&guard.slot)
+        let nonce_like = slot_has_nonce_semantic_hint(&guard.slot)
             || expression_has_nonce_semantic_hint(&guard.candidate)
-            || matches!(guard.kind, GuardKind::BoolClear | GuardKind::BitmapClear)
-        {
+            || matches!(guard.kind, GuardKind::BoolClear | GuardKind::BitmapClear);
+        if nonce_like {
             candidate_activity = true;
         }
-        guarded_slots.push(guard.slot.clone());
+        // Only one-time state counts for the cross-function rule: a slot the function writes after
+        // checking it, or a keyed nonce/used-flag slot. A checked signer, owner, pause flag or limit
+        // is configuration, and changing it elsewhere does not revive a used signature.
+        let written_after = writes
+            .iter()
+            .any(|write| write.pos >= guard.pos && write.slot.same_storage_location(&guard.slot));
+        if guard.authenticated && (written_after || nonce_like && !guard.slot.keys.is_empty()) {
+            guarded_slots.push(guard.slot.clone());
+            if guard.kind == GuardKind::BoolClear {
+                cleared_slots.push(guard.slot.clone());
+            }
+        }
         if guard.bypassable || guard.lossy || !guard.authenticated {
             continue;
         }
@@ -889,10 +924,19 @@ fn assess_entry_function(
         && effective < auth.signature_count
         && !has_shared_digest_identity_guard(&guards, &writes);
 
+    // A `require(!flag[x])` check is a used-flag guard only when the function then sets that flag;
+    // otherwise it is a configuration check such as `!isFrozen[sender]`. Without a nonce-like name, such
+    // a flag is the signature's protection only when nothing else consumes the authorization (a mint's
+    // token-existence check next to a signed per-caller flag is not).
+    let flag_consumed = |guard: &GuardFact| {
+        writes.iter().any(|write| write.pos >= guard.pos && write.slot.same_storage_location(&guard.slot))
+    };
     let has_ineffective_nonce_guard = guards.iter().any(|guard| {
         (slot_has_nonce_semantic_hint(&guard.slot)
             || expression_has_nonce_semantic_hint(&guard.candidate)
-            || matches!(guard.kind, GuardKind::BoolClear | GuardKind::BitmapClear))
+            || matches!(guard.kind, GuardKind::BoolClear | GuardKind::BitmapClear)
+                && flag_consumed(guard)
+                && effective == 0)
             && (guard.bypassable || guard.lossy || !guard.authenticated)
     });
 
@@ -904,7 +948,24 @@ fn assess_entry_function(
                 || expression_has_nonce_semantic_hint(&guard.candidate)
         });
 
+    // A function whose only effect is a one-way mark (`cancelled[order] = true`, `nonce++`) is a
+    // cancellation or invalidation: it authorises nothing that could be repeated.
+    let one_way = |write: &WriteFact| match write.kind {
+        WriteKind::Increment | WriteKind::AddAssign | WriteKind::OrAssign => true,
+        WriteKind::Assign => {
+            let rhs = compact(&write.rhs);
+            rhs == "true" || rhs == "1"
+        }
+        _ => false,
+    };
+    let body = compact(&model.source);
+    let cancellation_only = !writes.is_empty()
+        && writes.iter().all(|write| one_way(write))
+        && ![".call(", ".call{", "transfer(", "transferfrom(", "mint(", "send(", "approve("]
+            .iter()
+            .any(|effect| body.to_ascii_lowercase().contains(effect));
     let suspicious_unguarded_nonce_write = effective == 0
+        && !cancellation_only
         && writes
             .iter()
             .any(|write| write_looks_like_nonce_activity(write, auth, &model.assignments));
@@ -935,9 +996,30 @@ fn assess_entry_function(
             || unchecked_narrow_wrap,
         rollback_sensitive,
         guarded_slots,
+        cleared_slots,
     }
 }
 
+
+/// `require(recipient == msg.sender)` with a signed `recipient`: the caller is the signed account, so
+/// state keyed by `msg.sender` is keyed by a signed value.
+fn with_sender_binding(model: &FunctionModel, auth: &AuthSummary) -> AuthSummary {
+    let c = compact(&model.source);
+    let bound = identifiers_in_text(&model.source).into_iter().any(|id| {
+        auth.authenticated_roots.contains(&id)
+            && id != "sender"
+            && (c.contains(&format!("require({id}==msg.sender"))
+                || c.contains(&format!("require(msg.sender=={id}"))
+                || c.contains(&format!("if({id}!=msg.sender)revert"))
+                || c.contains(&format!("if(msg.sender!={id})revert")))
+    });
+    let mut out = auth.clone();
+    if bound {
+        out.authenticated_roots.insert("msg".to_string());
+        out.authenticated_roots.insert("sender".to_string());
+    }
+    out
+}
 
 /// Adds the state returned by helpers that are called inside the signed digest (e.g. `_useNonce(owner)`
 /// in `abi.encode`) to the authenticated roots.
@@ -1584,7 +1666,9 @@ fn write_is_effective_for_guard(
     model: &FunctionModel,
     xor_postcondition: bool,
 ) -> bool {
-    if write.conditional || early_return_before_write(&model.source, guard.pos, write.pos) {
+    if write.conditional && !write_in_body_of_guard_if(&model.source, guard.pos, write.pos)
+        || early_return_before_write(&model.source, guard.pos, write.pos)
+    {
         return false;
     }
     let rhs = compact(&expand_expression(&write.rhs, &model.assignments, 4));
@@ -1634,6 +1718,42 @@ fn write_is_effective_for_guard(
         },
         GuardKind::PresenceOnly => false,
     }
+}
+
+/// `if (stored < nonce && ..) { stored = nonce; .. }`: the write runs exactly when the check that holds
+/// the guard passes, so it consumes the authorization like a write after `require`.
+fn write_in_body_of_guard_if(source: &str, guard_pos: usize, write_pos: usize) -> bool {
+    let bytes = source.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = source.get(from..).and_then(|tail| tail.find("if")) {
+        let start = from + rel;
+        from = start + 2;
+        let word_start = start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+        let word_end = bytes.get(start + 2).is_none_or(|b| !(b.is_ascii_alphanumeric() || *b == b'_'));
+        if !word_start || !word_end || start > guard_pos {
+            continue;
+        }
+        let Some(open) = source[start + 2..].find('(').map(|i| start + 2 + i) else {
+            continue;
+        };
+        if !source[start + 2..open].trim().is_empty() {
+            continue;
+        }
+        let Some(close) = matching_delimiter(source, open, '(', ')') else {
+            continue;
+        };
+        if !(start <= guard_pos && guard_pos < close) {
+            continue;
+        }
+        let rest = &source[close + 1..];
+        let lead = rest.len() - rest.trim_start().len();
+        let body = close + 1 + lead;
+        if !source[body..].starts_with('{') {
+            return false;
+        }
+        return matching_delimiter(source, body, '{', '}').is_some_and(|end| body < write_pos && write_pos < end);
+    }
+    false
 }
 
 fn expression_advances_value(rhs: &str, candidate: &str, slot: &StateSlot) -> bool {
@@ -1770,6 +1890,14 @@ fn has_dangerous_cross_function_mutation(
         return false;
     }
     let entry_auth = auth_summaries.get(&entry.id).cloned().unwrap_or_default();
+    // Slots the signed function itself decreases (a balance it spends) are amounts, not one-time state.
+    let entry_locals = collect_local_names(&entry.source, &entry.parameters);
+    let entry_decreases: Vec<StateSlot> =
+        collect_writes(&entry.source, &entry.assignments, &entry.parameters, &entry_locals)
+            .into_iter()
+            .filter(|write| matches!(write.kind, WriteKind::SubAssign | WriteKind::Decrement))
+            .map(|write| write.slot)
+            .collect();
     for sibling in models.values() {
         if sibling.id == entry.id || sibling.scope != entry.scope || !sibling.entry_point {
             continue;
@@ -1800,6 +1928,19 @@ fn has_dangerous_cross_function_mutation(
                 .guarded_slots
                 .iter()
                 .any(|slot| slot.same_storage_family(&write.slot))
+            {
+                continue;
+            }
+            if matches!(write.kind, WriteKind::SubAssign | WriteKind::Decrement)
+                && entry_decreases.iter().any(|slot| slot.same_storage_family(&write.slot))
+            {
+                continue;
+            }
+            // A used-flag (checked zero/false) is revived only by clearing it; setting it to another
+            // non-zero value marks it used as well.
+            if write.kind == WriteKind::Assign
+                && assessment.cleared_slots.iter().any(|slot| slot.same_storage_family(&write.slot))
+                && !expression_is_false_or_zero(&compact(&expand_expression(&write.rhs, &sibling.assignments, 3)))
             {
                 continue;
             }
@@ -1865,6 +2006,16 @@ fn mutation_is_reversible_or_decreasing(
             let rhs = compact(&expand_expression(&write.rhs, &function.assignments, 3));
             if expression_is_false_or_zero(&rhs) {
                 return true;
+            }
+            // `nonces[a] = nonces[a] + 1` (possibly through a local copy) only moves the slot forward.
+            let current = compact(&format!(
+                "{}{}{}",
+                write.slot.base,
+                write.slot.keys.iter().map(|key| format!("[{key}]")).collect::<String>(),
+                write.slot.field.as_deref().map(|field| format!(".{field}")).unwrap_or_default()
+            ));
+            if rhs.starts_with(&format!("{current}+")) || rhs.starts_with(&format!("({current})+")) {
+                return false;
             }
             // Assigning an externally supplied value to an existing nonce slot is dangerous unless
             // the function proves the new value is strictly greater than current state.
@@ -2013,14 +2164,24 @@ fn slot_keys_authenticated(
         return true;
     }
     slot.keys.iter().all(|key| {
+        // `used[digest]` where `digest` is itself the signed value.
+        let own = identifiers_in_text(key);
+        if !own.is_empty()
+            && own.iter().all(|id| auth.authenticated_roots.contains(id) || auth.principal_roots.contains(id))
+        {
+            return true;
+        }
         let expanded = expand_expression(key, assignments, 4);
-        let ids = identifiers_in_text(&expanded);
+        let ids = identifiers_in_text(&without_string_literals(&expanded));
         ids.is_empty()
             || is_signature_recovery(&expanded)
             || ids.iter().all(|id| {
                 is_nonsemantic_member_identifier(id)
+                    || is_hashing_builtin(id)
                     || auth.authenticated_roots.contains(id)
                     || auth.principal_roots.contains(id)
+                    // `msg.sender` inside a signed digest: the roots keep `sender`.
+                    || id == "msg" && auth.authenticated_roots.contains("sender")
             })
             || (expanded.contains("msg.sender")
                 && auth.principal_roots.iter().any(|p| p == "msg" || p == "sender"))
@@ -2055,6 +2216,43 @@ fn expression_is_authenticated(
     ids.iter().any(|id| {
         auth.authenticated_roots.contains(id) || auth.principal_roots.contains(id)
     })
+}
+
+/// Removes the contents of string literals, whose words are not identifiers.
+fn without_string_literals(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in text.chars() {
+        match quote {
+            Some(q) => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == q {
+                    quote = None;
+                    out.push(ch);
+                }
+            }
+            None => {
+                if ch == '"' || ch == '\'' {
+                    quote = Some(ch);
+                }
+                out.push(ch);
+            }
+        }
+    }
+    out
+}
+
+/// Hashing and encoding built-ins carry no value of their own: `keccak256(abi.encode(a, b))` is as
+/// signed as `a` and `b`.
+fn is_hashing_builtin(id: &str) -> bool {
+    matches!(
+        id,
+        "keccak256" | "sha256" | "abi" | "encode" | "encodePacked" | "encodeWithSelector" | "encodeWithSignature"
+    )
 }
 
 fn is_nonsemantic_member_identifier(id: &str) -> bool {
@@ -2136,19 +2334,46 @@ fn parse_parameters(source: &str) -> Vec<Parameter> {
 
 fn collect_local_names(source: &str, parameters: &[Parameter]) -> BTreeSet<String> {
     let mut out: BTreeSet<String> = parameters.iter().map(|p| p.name.clone()).collect();
-    for statement in split_statements(source) {
-        let trimmed = statement.trim_start_matches(|c: char| c == '{' || c == '}').trim();
-        let ids = identifier_sequence(trimmed);
+    out.extend(super::signature_utils::named_return_variables(source));
+    let pieces = split_statements(source)
+        .into_iter()
+        .flat_map(|statement| super::signature_utils::block_pieces(&statement));
+    for piece in pieces {
+        let mut trimmed = piece.trim();
+        // `for (uint256 i = 0; ...` declares `i`.
+        if let Some(rest) = trimmed.strip_prefix("for") {
+            trimmed = rest.trim_start().trim_start_matches('(').trim_start();
+        }
+        // The declared part ends at the first assignment (`=` that is not `==`, `<=`, `>=`, `!=`).
+        let bytes = trimmed.as_bytes();
+        let eq = (0..bytes.len()).find(|&i| {
+            bytes[i] == b'='
+                && bytes.get(i + 1) != Some(&b'=')
+                && !matches!(i.checked_sub(1).map(|j| bytes[j]), Some(b'=' | b'!' | b'<' | b'>' | b':'))
+        });
+        let lhs = trimmed[..eq.unwrap_or(trimmed.len())].trim();
+        if lhs.starts_with('(') {
+            // `(bool ok, bytes memory ret) = ..`
+            for part in super::signature_utils::split_top_level(lhs.trim_start_matches('(').trim_end_matches(')'), ',') {
+                let ids = identifier_sequence(&part);
+                if ids.len() >= 2 && is_type_keyword(&ids[0]) {
+                    out.extend(ids.last().cloned());
+                }
+            }
+            continue;
+        }
+        if lhs.contains('[') && !lhs.contains("[]") || lhs.contains('.') {
+            continue;
+        }
+        let ids = identifier_sequence(lhs);
         if ids.len() < 2 {
             continue;
         }
-        let first = ids[0].as_str();
-        if is_type_keyword(first) || first.starts_with("uint") || first.starts_with("int") || first.starts_with("bytes") {
-            if let Some(eq) = trimmed.find('=') {
-                if let Some(name) = identifier_sequence(&trimmed[..eq]).into_iter().last() {
-                    out.insert(name);
-                }
-            }
+        // Value types, and user-defined types in memory or calldata. A storage pointer is not a
+        // local: writes through it change contract state.
+        let memory_local = contains_word(lhs, "memory") || contains_word(lhs, "calldata");
+        if (is_type_keyword(&ids[0]) && !contains_word(lhs, "storage")) || memory_local {
+            out.extend(ids.last().cloned());
         }
     }
     out
@@ -2733,5 +2958,15 @@ mod nonce_management_tests {
     #[test]
     fn handles_multibyte_characters() {
         assert_eq!(run("../tests/contract-playground/src/signature-patterns/UnicodeStrings.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_common_safe_nonce_patterns() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/NonceSafePatterns.sol"), 0);
+    }
+
+    #[test]
+    fn detects_used_flag_never_checked() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/NonceUsedFlagNeverChecked.sol"), 1);
     }
 }
