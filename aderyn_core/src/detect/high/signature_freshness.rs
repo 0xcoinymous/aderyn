@@ -350,6 +350,13 @@ fn analyze_freshness(
         return None;
     }
 
+    // A signed one-time key that is checked and consumed (a nonce, a used-hash flag, a voucher or
+    // transaction id) bounds the authorization to one use, and a function that only marks state one
+    // way (a cancellation) authorises nothing; neither needs a deadline.
+    if consumes_signed_one_time_key(model, models, auth) || is_cancellation_only(model) {
+        return None;
+    }
+
     let signed_forever_sentinel = auth
         .authenticated_exprs
         .iter()
@@ -644,6 +651,9 @@ fn freshness_semantic_from_name(name: &str) -> Option<FreshnessSemantic> {
         || n.contains("expiry")
         || n.contains("expiration")
         || n.contains("expiresat")
+        || n.contains("expires")
+        || n.contains("validityend")
+        || n.contains("validtill")
         || n.contains("validbefore")
         || n.contains("validuntil")
         || n.contains("validthrough")
@@ -660,6 +670,7 @@ fn freshness_semantic_from_name(name: &str) -> Option<FreshnessSemantic> {
     }
 
     let lower = n.contains("validafter")
+        || n.contains("validitystart")
         || n.contains("validfrom")
         || n.contains("notbefore")
         || n.contains("starttime")
@@ -956,6 +967,71 @@ fn assignment_updates_state_from_candidate(
     })
 }
 
+/// The function or a helper it calls checks a storage slot keyed by a signed value (`!used[k]`,
+/// `nonces[a] == n`, `status[id] == ..`) and then writes that slot (`used[k] = true`, `nonces[a]++`).
+fn consumes_signed_one_time_key(
+    model: &FunctionModel,
+    models: &BTreeMap<NodeID, FunctionModel>,
+    auth: &AuthSummary,
+) -> bool {
+    let mut sources = vec![model.source.clone()];
+    sources.extend(model.calls.iter().filter_map(|call| models.get(&call.callee)).map(|m| m.source.clone()));
+    let text = sources.join("\n");
+    let c = canonical_expr(&text);
+    let predicates: Vec<String> = sources.iter().flat_map(|s| collect_required_predicates(s)).collect();
+    // Written slots `base[key]` with a one-way update.
+    let pieces = super::signature_utils::split_statements(&text)
+        .into_iter()
+        .flat_map(|statement| super::signature_utils::block_pieces(&statement));
+    for statement in pieces {
+        let st = canonical_expr(&statement);
+        let Some(open) = st.find('[') else { continue };
+        let base = &st[..open];
+        let base = base.rsplit(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).next().unwrap_or("");
+        if base.is_empty() {
+            continue;
+        }
+        let Some(close) = matching_delimiter(&st, open, '[', ']') else { continue };
+        let key = &st[open + 1..close];
+        let rest = &st[close + 1..];
+        let one_way = rest.starts_with("++")
+            || rest.starts_with("+=")
+            || rest.starts_with("=true")
+            || rest.starts_with("=1;")
+            || rest == "=1"
+            || (rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=0") && !rest.starts_with("=false"));
+        if !one_way {
+            continue;
+        }
+        let key_signed = identifiers_in_text(key).iter().any(|id| auth.authenticated_names.contains(id))
+            || auth.authenticated_exprs.iter().any(|expr| canonical_expr(expr) == key);
+        let checked = predicates.iter().any(|predicate| canonical_expr(predicate).contains(&format!("{base}[")))
+            || c.contains(&format!("{base}[{key}]++=="))
+            || c.contains(&format!("=={base}[{key}]++"));
+        if key_signed && checked {
+            return true;
+        }
+    }
+    false
+}
+
+/// Every write is a one-way mark (`= true`, `++`, `|=`) and nothing moves value or calls out.
+fn is_cancellation_only(model: &FunctionModel) -> bool {
+    let body = canonical_expr(function_body(&model.source).unwrap_or(&model.source)).to_ascii_lowercase();
+    if [".call(", ".call{", "transfer(", "transferfrom(", "mint(", "send(", "approve(", "burn("]
+        .iter()
+        .any(|effect| body.contains(effect))
+    {
+        return false;
+    }
+    let lower = body.as_str();
+    (lower.contains("cancel") || lower.contains("invalidat") || lower.contains("revok"))
+        && model.assignment_facts.iter().all(|fact| {
+            let rhs = canonical_expr(&fact.rhs).to_ascii_lowercase();
+            rhs == "true" || rhs == "1" || rhs.contains("max") || rhs.ends_with(".amount") || rhs.ends_with("amount")
+        })
+}
+
 fn has_authenticated_revocation_generation(auth: &AuthSummary) -> bool {
     auth.authenticated_names.iter().any(|name| {
         let n = compact_name(name);
@@ -1219,10 +1295,12 @@ fn collect_required_predicates(source: &str) -> Vec<String> {
     let source = strip_comments(source);
     let mut out = Vec::new();
 
-    for name in ["require", "assert"] {
+    // `Require.that(cond, ..)` and `_require(cond, ..)` wrappers revert like `require`.
+    for name in ["require", "assert", "that", "_require", "requireThat"] {
         for args in find_calls_named(&source, name) {
             if let Some(first) = args.first() {
-                out.push(strip_outer_parens(first.trim()).to_string());
+                let predicate = strip_outer_parens(first.trim()).to_string();
+                out.push(without_signer_opt_out(&predicate));
             }
         }
     }
@@ -1254,6 +1332,24 @@ fn collect_required_predicates(source: &str) -> Vec<String> {
     }
 
     out
+}
+
+/// `expiry == 0 || now <= expiry` enforces the deadline the signer chose; signing zero is an explicit
+/// choice of no expiry by the signer (DAI-style permits), so the bound is `now <= expiry`.
+fn without_signer_opt_out(predicate: &str) -> String {
+    let parts: Vec<&str> = predicate.split("||").collect();
+    if parts.len() != 2 {
+        return predicate.to_string();
+    }
+    for (zero, other) in [(parts[0], parts[1]), (parts[1], parts[0])] {
+        let z = canonical_expr(zero.trim().trim_start_matches('(').trim_end_matches(')'));
+        if let Some(name) = z.strip_suffix("==0") {
+            if !name.is_empty() && identifiers_in_text(other).contains(name) {
+                return other.trim().to_string();
+            }
+        }
+    }
+    predicate.to_string()
 }
 
 fn invert_predicate(condition: &str) -> String {
@@ -1744,11 +1840,14 @@ fn canonical_expr(source: &str) -> String {
 }
 
 fn contains_block_timestamp(source: &str) -> bool {
-    // `now` is the pre-0.7 alias of `block.timestamp`.
-    canonical_expr(source)
-        .to_ascii_lowercase()
-        .contains("block.timestamp")
+    // `now` is the pre-0.7 alias of `block.timestamp`; `_now()`, `getBlockTimestamp()` and similar
+    // helpers wrap it.
+    let c = canonical_expr(source).to_ascii_lowercase();
+    c.contains("block.timestamp")
         || contains_word(source, "now")
+        || ["_now()", "getnow()", "_getnow()", "blocktimestamp()", "_blocktimestamp()", "getblocktimestamp()", "currenttime()", "_currenttime()", "_time()"]
+            .iter()
+            .any(|helper| c.contains(helper))
 }
 
 fn contains_block_number(source: &str) -> bool {
@@ -2016,5 +2115,23 @@ mod tests {
         assert!(predicates
             .iter()
             .any(|p| canonical_expr(p).contains("block.timestamp<=validBefore")));
+    }
+
+    fn run(path: &str) -> usize {
+        let context = crate::detect::test_utils::load_solidity_source_unit(path);
+        let mut detector = SignatureFreshnessDetector::default();
+        detector.detect(&context).unwrap();
+        detector.instances().len()
+    }
+
+    #[test]
+    fn accepts_opt_out_expiry_wrappers_and_one_time_ids() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/FreshnessSafePatterns.sol"), 0);
+    }
+
+    #[test]
+    fn opt_out_disjunction_keeps_the_deadline_bound() {
+        assert_eq!(without_signer_opt_out("expiry == 0 || now <= expiry"), "now <= expiry");
+        assert_eq!(without_signer_opt_out("a == 0 || now <= b"), "a == 0 || now <= b");
     }
 }
