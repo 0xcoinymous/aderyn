@@ -133,6 +133,7 @@ struct LowLevel1271Call {
 
 impl IssueDetector for EIP1271VerificationDetector {
     fn detect(&mut self, context: &WorkspaceContext) -> Result<bool, Box<dyn Error>> {
+        set_magic_constants(context);
         let models = build_models(context);
         if models.is_empty() {
             return Ok(false);
@@ -213,7 +214,9 @@ impl IssueDetector for EIP1271VerificationDetector {
             if !model.sig.is_entry_point() || model.sig.is_read_only() {
                 continue;
             }
-            if !function_has_sensitive_effect(model) {
+            // An entry point only the owner or an authorised account can call cannot be used by an
+            // attacker to pick the validating account.
+            if !function_has_sensitive_effect(model) || has_access_control_signal(&model.source) {
                 continue;
             }
             if entry_has_unsafe_signer_provenance(model.id, &models, MAX_CALL_DEPTH) {
@@ -297,14 +300,39 @@ fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
             .push(CallSite { callee, args });
     }
 
+    let source_by_id: HashMap<NodeID, String> = context
+        .function_definitions()
+        .into_iter()
+        .map(|f| (f.id, super::signature_utils::blank_comments(&f.peek(context).unwrap_or_default())))
+        .collect();
     let mut members_by_function: HashMap<NodeID, BTreeSet<String>> = HashMap::new();
     for member in context.member_accesss() {
         let Some(node_span) = SrcSpan::parse(&member.src) else {
             continue;
         };
-        let Some((id, _)) = enclosing_function(node_span, &function_spans) else {
+        let Some((id, fspan)) = enclosing_function(node_span, &function_spans) else {
             continue;
         };
+        // A library or bound member call (`Lib.f(a)`, `x.f(a)` under `using Lib for T`) is a call
+        // edge like a plain internal call; a bound call passes `x` as the first parameter.
+        if let Some(callee) = member.referenced_declaration.filter(|callee| {
+            *callee != id && source_by_id.get(callee).is_some_and(|s| s.contains('{'))
+        }) {
+            let source = &source_by_id[&id];
+            let local_pos = node_span.start.saturating_sub(fspan.start);
+            if let Some((receiver, member_args)) =
+                super::signature_utils::member_call_parts(source, local_pos, &member.member_name)
+            {
+                let arity = parse_function_signature(&source_by_id[&callee]).params.len();
+                let args = match receiver {
+                    Some(receiver) if arity == member_args.len() + 1 => {
+                        std::iter::once(receiver).chain(member_args).collect()
+                    }
+                    _ => member_args,
+                };
+                call_sites_by_function.entry(id).or_default().push(CallSite { callee, args });
+            }
+        }
         members_by_function
             .entry(id)
             .or_default()
@@ -376,13 +404,17 @@ fn implementation_changes_state(
     depth: usize,
 ) -> bool {
     let mut visited = BTreeSet::new();
-    recursive_state_effect(root, models, depth, &mut visited)
+    recursive_state_effect(root, models, depth, &BTreeSet::new(), &mut visited)
 }
 
+/// `disabled` holds the bool parameters of `id` that its caller passes as the literal `false`; a branch
+/// that runs only when such a parameter is true (`if (consume && ..) { .. }`) cannot run on this path,
+/// as in Gnosis Safe's `checkSignatures(hash, data, sig, false)` called from `isValidSignature`.
 fn recursive_state_effect(
     id: NodeID,
     models: &BTreeMap<NodeID, FunctionModel>,
     depth: usize,
+    disabled: &BTreeSet<String>,
     visited: &mut BTreeSet<NodeID>,
 ) -> bool {
     if depth == 0 || !visited.insert(id) {
@@ -391,21 +423,36 @@ fn recursive_state_effect(
     let Some(model) = models.get(&id) else {
         return false;
     };
-    if direct_state_effect(model) {
+    if direct_state_effect_without(model, disabled) {
         return true;
     }
-    model
-        .calls
-        .iter()
-        .any(|call| recursive_state_effect(call.callee, models, depth - 1, visited))
+    model.calls.iter().any(|call| {
+        let callee_disabled = models.get(&call.callee).map_or_else(BTreeSet::new, |callee| {
+            callee
+                .sig
+                .params
+                .iter()
+                .zip(&call.args)
+                .filter(|(param, arg)| normalize_type(&param.ty) == "bool" && compact(arg) == "false")
+                .map(|(param, _)| param.name.clone())
+                .collect()
+        });
+        recursive_state_effect(call.callee, models, depth - 1, &callee_disabled, visited)
+    })
 }
 
 fn direct_state_effect(model: &FunctionModel) -> bool {
+    direct_state_effect_without(model, &BTreeSet::new())
+}
+
+fn direct_state_effect_without(model: &FunctionModel, disabled: &BTreeSet<String>) -> bool {
     if model.sig.is_read_only() {
         return false;
     }
 
     let body = function_body(&model.source).unwrap_or(&model.source);
+    let body = without_disabled_branches(body, disabled);
+    let body = body.as_str();
     let compacted = compact(body);
     if contains_word(body, "emit")
         || compacted.contains(".call(")
@@ -420,7 +467,7 @@ fn direct_state_effect(model: &FunctionModel) -> bool {
     }
 
     let locals = collect_probable_local_names(model);
-    for statement in split_statements(body) {
+    for statement in split_statements(body).iter().flat_map(|statement| block_pieces(statement)) {
         let s = statement.trim();
         if s.is_empty() {
             continue;
@@ -432,6 +479,44 @@ fn direct_state_effect(model: &FunctionModel) -> bool {
         }
     }
     false
+}
+
+/// Removes the body of every `if (c)` whose condition is a conjunction containing a disabled parameter.
+fn without_disabled_branches(body: &str, disabled: &BTreeSet<String>) -> String {
+    if disabled.is_empty() {
+        return body.to_string();
+    }
+    let mut out = body.to_string();
+    let mut from = 0;
+    while let Some(pos) = find_word_from(&out, "if", from) {
+        let Some(open) = out[pos + 2..].find('(').map(|x| pos + 2 + x) else {
+            break;
+        };
+        let Some(close) = matching_delimiter(&out, open, '(', ')') else {
+            break;
+        };
+        let condition = compact(&out[open + 1..close]);
+        let requires_disabled = !condition.contains("||")
+            && condition
+                .split("&&")
+                .any(|part| disabled.contains(part.trim_matches(|ch| ch == '(' || ch == ')')));
+        from = close + 1;
+        if !requires_disabled {
+            continue;
+        }
+        let rest = &out[close + 1..];
+        let lead = rest.len() - rest.trim_start().len();
+        let start = close + 1 + lead;
+        let end = if out[start..].starts_with('{') {
+            matching_delimiter(&out, start, '{', '}').map(|e| e + 1)
+        } else {
+            out[start..].find(';').map(|e| start + e + 1)
+        };
+        if let Some(end) = end {
+            out.replace_range(start..end, ";");
+        }
+    }
+    out
 }
 
 fn function_has_sensitive_effect(model: &FunctionModel) -> bool {
@@ -494,15 +579,10 @@ fn collect_strong_input_use(
         if !is_strong_verification_call(&call.name) {
             continue;
         }
-        if call.args.iter().any(|arg| {
-            expr_depends_on_aliases(arg, hash_aliases, &model.assignments, 7)
-        }) {
-            result.hash = true;
-        }
-        if call.args.iter().any(|arg| {
-            expr_depends_on_aliases(arg, signature_aliases, &model.assignments, 7)
-        }) {
-            result.signature = true;
+        let inputs = call.args.iter().chain(call.receiver.iter());
+        for arg in inputs {
+            result.hash |= expr_depends_on_aliases(arg, hash_aliases, &model.assignments, 7);
+            result.signature |= expr_depends_on_aliases(arg, signature_aliases, &model.assignments, 7);
         }
     }
 
@@ -568,7 +648,8 @@ fn implementation_magic_semantics_bad(
         let Some(model) = models.get(&id) else {
             continue;
         };
-        if !source_has_strong_verification_call(body_of(model)) {
+        // A call may resolve to an abstract or interface declaration; only implementations return.
+        if !model.sig.has_body || !source_has_strong_verification_call(body_of(model)) {
             continue;
         }
         // Only functions that produce the ERC-1271 result can get the magic value wrong; recovery
@@ -589,6 +670,14 @@ fn local_magic_semantics_bad(model: &FunctionModel) -> bool {
     let returns = collect_return_expressions(&model.source);
     if returns.is_empty() {
         return true;
+    }
+    // A wrapper that returns another `isValidSignature(..)` forwards that function's answer; the
+    // magic value is decided, and analysed, in the callee.
+    if returns.iter().all(|expr| {
+        let c = compact(expr).to_ascii_lowercase();
+        c.starts_with("isvalidsignature(") || c.contains(".isvalidsignature(") && !c.contains("==")
+    }) {
+        return false;
     }
     if !returns.iter().any(|expr| is_magic_expr(expr)) {
         return true;
@@ -657,18 +746,23 @@ fn condition_depends_on_verifier(condition: &str, vars: &BTreeSet<String>) -> bo
 fn condition_true_means_success(condition: &str) -> bool {
     let c = compact(condition);
     // `recovered != address(0) && recovered == owner` is a success condition: a zero-address guard
-    // inside a conjunction does not invert it.
+    // inside a conjunction does not invert it. Matching the prefix `!=address(0` keeps the check
+    // independent of how many closing parentheses follow.
     let conjuncts: Vec<&str> = c
         .split("&&")
-        .filter(|part| {
-            let p = part.trim_start_matches('(').trim_end_matches(')');
-            !(p.ends_with("!=address(0)") || p.ends_with("!=address(0x0)"))
-        })
+        .filter(|part| !(part.contains("!=address(0)") || part.contains("!=address(0x0)")))
         .collect();
     if conjuncts.is_empty() {
         return true;
     }
-    !conjuncts.iter().any(|part| part.starts_with('!') || part.contains("!="))
+    // `signer == address(0)` is the failure of a recovery, like `!valid` or `signer != owner`.
+    !conjuncts.iter().any(|part| {
+        let part = part.trim_start_matches('(');
+        part.starts_with('!')
+            || part.contains("!=")
+            || part.contains("==address(0)")
+            || part.contains("==address(0x0)")
+    })
 }
 
 fn implementation_uses_attacker_controlled_identity(
@@ -981,16 +1075,20 @@ fn direct_call_result_variable(source: &str, call: &ParsedCall) -> Option<String
 fn has_exact_magic_comparison_for_var(source: &str, var: &str) -> bool {
     let c = compact(source).to_ascii_lowercase();
     let v = compact(var).to_ascii_lowercase();
-    if [ERC1271_MAGIC, ERC1271_LEGACY_MAGIC]
-        .iter()
-        .any(|magic| c.contains(&format!("{v}=={magic}")) || c.contains(&format!("{magic}=={v}")))
-    {
-        return true;
-    }
-    if (c.contains(&format!("{}==", v)) || c.contains(&format!("=={}", v)))
-        && (c.contains("isvalidsignature.selector") || contains_magic_identifier(source))
-    {
-        return true;
+    // `result == MAGIC` accepts exactly the magic value; `result != MAGIC` (then revert or return
+    // false) rejects everything else, which is the same exact check.
+    for op in ["==", "!="] {
+        if [ERC1271_MAGIC, ERC1271_LEGACY_MAGIC]
+            .iter()
+            .any(|magic| c.contains(&format!("{v}{op}{magic}")) || c.contains(&format!("{magic}{op}{v}")))
+        {
+            return true;
+        }
+        if (c.contains(&format!("{v}{op}")) || c.contains(&format!("{op}{v}")))
+            && (c.contains("isvalidsignature.selector") || contains_magic_identifier(source))
+        {
+            return true;
+        }
     }
     false
 }
@@ -1011,10 +1109,32 @@ fn caller_eoa_contract_branch_bad(model: &FunctionModel) -> bool {
     // to ERC-1271.  This is deliberately narrow to avoid penalizing legitimate SignatureChecker
     // patterns (and newer EIP-7702-aware variations that do not use this exact split).
     let contract_branch = compacted.contains(".code.length!=0") || compacted.contains(".code.length>0");
-    contract_branch
+    if !(contract_branch
         && (compacted.contains("recover(") || compacted.contains("ecrecover("))
         && compacted.contains(".staticcall(")
-        && compacted.contains("isValidSignature.selector")
+        && compacted.contains("isValidSignature.selector"))
+    {
+        return false;
+    }
+    // The order is reversed only when the branch taken for contracts recovers instead of calling
+    // ERC-1271; `if (signer.code.length > 0) { staticcall .. }` followed by ECDSA is the correct order.
+    let marker = [".code.length>0", ".code.length!=0"]
+        .iter()
+        .filter_map(|m| compacted.find(m).map(|pos| pos + m.len()))
+        .min();
+    let contract_block = marker.and_then(|pos| {
+        let open = pos + compacted[pos..].find('{')?;
+        let close = matching_delimiter(&compacted, open, '{', '}')?;
+        Some(&compacted[open..close])
+    });
+    match contract_block {
+        Some(block) => {
+            (block.contains("recover(") || block.contains("ecrecover("))
+                && !block.contains(".staticcall(")
+                && !block.contains(".isValidSignature(")
+        }
+        None => true,
+    }
 }
 
 fn entry_has_unsafe_signer_provenance(
@@ -1051,7 +1171,7 @@ fn entry_has_unsafe_signer_provenance(
             if path_has_contract_only_erc1271(entry, models, depth) {
                 return true;
             }
-        } else if let Some(state_like) = single_identifier_expr(&target) {
+        } else if let Some(state_like) = single_identifier_expr(&target).filter(|name| is_state_variable(name)) {
             if scope_has_unguarded_assignment(model.scope, &state_like, models) {
                 return true;
             }
@@ -1101,8 +1221,13 @@ fn direct_erc1271_target_exprs(model: &FunctionModel) -> Vec<String> {
     let mut from = 0;
     while let Some(rel) = source[from..].find(".isValidSignature(") {
         let dot = from + rel;
-        if let Some(target) = expression_before_member(source, dot) {
-            out.push(unwrap_interface_cast_argument(&target));
+        let open = dot + ".isValidSignature".len();
+        let two_args = matching_delimiter(source, open, '(', ')')
+            .is_some_and(|close| split_top_level(&source[open + 1..close], ',').len() == 2);
+        if two_args {
+            if let Some(target) = expression_before_member(source, dot) {
+                out.push(unwrap_interface_cast_argument(&target));
+            }
         }
         from = dot + ".isValidSignature(".len();
     }
@@ -1179,6 +1304,10 @@ fn scope_has_unguarded_assignment(
         if has_access_control_signal(&sibling.source) {
             continue;
         }
+        // A local or parameter with the same name is not the state variable.
+        if collect_probable_local_names(sibling).contains(variable) {
+            continue;
+        }
         for statement in split_statements(&sibling.source) {
             let Some((lhs, _)) = split_assignment(&statement) else {
                 continue;
@@ -1199,10 +1328,30 @@ fn has_access_control_signal(source: &str) -> bool {
     if c.contains("msg.sender==") || c.contains("==msg.sender") || c.contains("msg.sender!=") {
         return true;
     }
-    let header = source.split('{').next().unwrap_or(source);
-    identifier_sequence(header)
+    // `onlyOwner` as a modifier or called in the body (`onlyOwner();`).
+    if identifier_sequence(source)
         .iter()
         .any(|id| id.to_ascii_lowercase().starts_with("only"))
+    {
+        return true;
+    }
+    // Any other modifier on the function (`authorized`, `auth`, `whenAdmin`) is taken as a guard.
+    let header = source.split('{').next().unwrap_or(source);
+    let Some(params_open) = header.find('(') else {
+        return false;
+    };
+    let Some(params_close) = matching_delimiter(header, params_open, '(', ')') else {
+        return false;
+    };
+    let after = &header[params_close + 1..];
+    let after = after.split("returns").next().unwrap_or(after);
+    identifier_sequence(after).iter().any(|id| {
+        !matches!(
+            id.as_str(),
+            "public" | "external" | "internal" | "private" | "view" | "pure" | "payable" | "virtual"
+                | "override" | "constant"
+        )
+    })
 }
 
 fn collect_low_level_1271_calls(model: &FunctionModel) -> Vec<LowLevel1271Call> {
@@ -1369,9 +1518,45 @@ fn magic_operand(operand: &str) -> bool {
     operand.contains(ERC1271_MAGIC)
         || operand.contains(ERC1271_LEGACY_MAGIC)
         || operand.ends_with("isvalidsignature.selector")
-        || identifier_sequence(operand)
-            .iter()
-            .any(|id| id.to_ascii_lowercase().contains("magic"))
+        || contains_magic_identifier(operand)
+}
+
+thread_local! {
+    /// Names of the mutable state variables of the analysed contracts.
+    static STATE_VARIABLES: std::cell::RefCell<BTreeSet<String>> = Default::default();
+    /// Names of state constants and immutables of the analysed contracts whose value is an ERC-1271
+    /// magic value, such as `bytes4 constant VALID_SIG = IERC1271.isValidSignature.selector`.
+    static MAGIC_CONSTANTS: std::cell::RefCell<BTreeSet<String>> = Default::default();
+}
+
+fn set_magic_constants(context: &WorkspaceContext) {
+    let names = context
+        .variable_declarations()
+        .into_iter()
+        .filter(|variable| variable.state_variable)
+        .filter(|variable| {
+            let text = variable.peek(context).unwrap_or_default();
+            let value = compact(text.split_once('=').map_or("", |(_, value)| value)).to_ascii_lowercase();
+            value.contains(ERC1271_MAGIC)
+                || value.contains(ERC1271_LEGACY_MAGIC)
+                || value.ends_with("isvalidsignature.selector")
+                || value.contains("keccak256(\"isvalidsignature(bytes32,bytes)\")")
+                || value.contains("keccak256(\"isvalidsignature(bytes,bytes)\")")
+        })
+        .map(|variable| variable.name.clone())
+        .collect();
+    MAGIC_CONSTANTS.with(|set| *set.borrow_mut() = names);
+    let state = context
+        .variable_declarations()
+        .into_iter()
+        .filter(|variable| variable.state_variable && !variable.constant)
+        .map(|variable| variable.name.clone())
+        .collect();
+    STATE_VARIABLES.with(|set| *set.borrow_mut() = state);
+}
+
+fn is_state_variable(name: &str) -> bool {
+    STATE_VARIABLES.with(|set| set.borrow().contains(name))
 }
 
 fn source_has_magic(source: &str) -> bool {
@@ -1380,14 +1565,22 @@ fn source_has_magic(source: &str) -> bool {
 }
 
 fn contains_magic_identifier(source: &str) -> bool {
-    // `MAGIC_VALUE`, `_ERC_1271_MAGIC_VALUE`, `LEGACY_MAGIC_VALUE`, ...
-    identifier_sequence(source).iter().any(|id| id.to_ascii_lowercase().contains("magic"))
+    // `MAGIC_VALUE`, `_ERC_1271_MAGIC_VALUE`, `LEGACY_MAGIC_VALUE`, or a constant holding the value.
+    MAGIC_CONSTANTS.with(|constants| {
+        let constants = constants.borrow();
+        identifier_sequence(source)
+            .iter()
+            .any(|id| id.to_ascii_lowercase().contains("magic") || constants.contains(id))
+    })
 }
 
 #[derive(Debug, Clone)]
 struct ParsedCall {
     name: String,
     args: Vec<String>,
+    /// `x` of a member call `x.f(..)` when `x` is a value rather than a type or library name; a bound
+    /// library call (`digest.recover(sig)`) passes it as the first argument.
+    receiver: Option<String>,
 }
 
 fn scan_call_expressions(source: &str) -> Vec<ParsedCall> {
@@ -1416,11 +1609,23 @@ fn scan_call_expressions(source: &str) -> Vec<ParsedCall> {
             i += 1;
             continue;
         };
+        let receiver = (j > 0 && bytes[j - 1] == b'.')
+            .then(|| {
+                let dot = j - 1;
+                let mut k = dot;
+                while k > 0 && is_ident_continue(bytes[k - 1]) {
+                    k -= 1;
+                }
+                source[k..dot].to_string()
+            })
+            .filter(|r| r.as_bytes().first().is_some_and(|b| b.is_ascii_lowercase() || *b == b'_'));
         out.push(ParsedCall {
             name,
             args: split_top_level(&source[i + 1..close], ','),
+            receiver,
         });
-        i = close + 1;
+        // Continue inside the arguments: a recovery nested in `require(..)` or `if (..)` is a call too.
+        i += 1;
     }
     out
 }
@@ -1434,10 +1639,12 @@ fn collect_direct_is_valid_signature_calls(source: &str) -> Vec<ParsedCall> {
         let Some(close) = matching_delimiter(source, open, '(', ')') else {
             break;
         };
-        out.push(ParsedCall {
-            name: "isValidSignature".into(),
-            args: split_top_level(&source[open + 1..close], ','),
-        });
+        let args = split_top_level(&source[open + 1..close], ',');
+        // ERC-1271 takes (hash, signature); a three-argument `Lib.isValidSignature(hash, signer, sig)`
+        // is an ECDSA helper that happens to share the name.
+        if args.len() == 2 {
+            out.push(ParsedCall { name: "isValidSignature".into(), args, receiver: None });
+        }
         from = close + 1;
     }
     out
@@ -1501,6 +1708,8 @@ fn mapping_bases_indexed_by(source: &str, index: &str) -> BTreeSet<String> {
     out
 }
 
+/// Returned expressions, including values assigned to a named return variable
+/// (`returns (bytes4 magicValue)` ... `magicValue = MAGIC;`).
 fn collect_return_expressions(source: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut from = 0;
@@ -1509,6 +1718,21 @@ fn collect_return_expressions(source: &str) -> Vec<String> {
         let end = rest.find(';').unwrap_or(rest.len());
         out.push(rest[..end].trim().to_string());
         from = pos + "return".len() + end + 1;
+    }
+    let named = super::signature_utils::named_return_variables(source);
+    if !named.is_empty() {
+        let body = function_body(source).unwrap_or("");
+        for piece in split_statements(body).iter().flat_map(|statement| block_pieces(statement)) {
+            if piece.contains(":=") {
+                continue;
+            }
+            let Some((lhs, rhs)) = split_assignment(&piece) else {
+                continue;
+            };
+            if last_identifier(lhs).is_some_and(|name| named.contains(&name)) {
+                out.push(rhs.trim().trim_end_matches(';').trim().to_string());
+            }
+        }
     }
     out
 }
@@ -1645,14 +1869,25 @@ fn collect_probable_local_names(model: &FunctionModel) -> BTreeSet<String> {
         .filter(|p| !p.name.is_empty())
         .map(|p| p.name.clone())
         .collect();
-    for statement in split_statements(body_of(model)) {
-        if !looks_like_variable_declaration(&statement) {
+    out.extend(super::signature_utils::named_return_variables(&model.source));
+    let pieces = split_statements(body_of(model)).into_iter().flat_map(|statement| block_pieces(&statement));
+    for statement in pieces {
+        let statement = statement.trim().trim_end_matches(';').trim();
+        // `for (uint256 i = 0; ...` declares `i` as well.
+        let statement = statement.strip_prefix("for").map_or(statement, |rest| rest.trim_start().trim_start_matches('('));
+        if !looks_like_variable_declaration(statement) {
             continue;
         }
-        if let Some((lhs, _)) = split_assignment(&statement) {
-            if let Some(name) = last_identifier(lhs) {
-                out.insert(name);
+        let lhs = split_assignment(statement).map_or(statement, |(lhs, _)| lhs).trim();
+        if lhs.starts_with('(') {
+            // `(bool ok, bytes memory ret) = ..`: every typed component is a local.
+            for part in split_top_level(lhs.trim_start_matches('(').trim_end_matches(')'), ',') {
+                if identifier_sequence(&part).len() > 1 {
+                    out.extend(last_identifier(&part));
+                }
             }
+        } else if let Some(name) = last_identifier(lhs) {
+            out.insert(name);
         }
     }
     out
@@ -1671,11 +1906,23 @@ fn looks_like_variable_declaration(statement: &str) -> bool {
     let Some(first) = identifier_sequence(s).first().cloned() else {
         return false;
     };
-    is_type_or_location_keyword(&first) || first.starts_with('I') && s.contains(first.as_str())
+    let lhs = split_assignment(s).map_or(s, |(lhs, _)| lhs);
+    // `Order memory order = ..`, `bytes calldata data`: a user-defined type in memory or calldata. A
+    // storage pointer is left out on purpose, since writing through it changes contract state.
+    let memory_local = identifier_sequence(lhs).len() >= 3
+        && (contains_word(lhs, "memory") || contains_word(lhs, "calldata"));
+    is_type_or_location_keyword(&first)
+        || memory_local
+        || first.starts_with('I') && s.contains(first.as_str())
 }
 
 fn mutation_lvalue_base(statement: &str) -> Option<String> {
     let s = statement.trim();
+    // Inline-assembly assignments (`let pos := ..`, `r := mload(..)`) write Yul locals; storage writes
+    // in assembly are caught through `sstore(`.
+    if s.contains(":=") {
+        return None;
+    }
     if contains_word(s, "delete") {
         let pos = find_word_from(s, "delete", 0)?;
         return first_identifier(&s[pos + "delete".len()..]);
@@ -1683,22 +1930,33 @@ fn mutation_lvalue_base(statement: &str) -> Option<String> {
 
     for op in ["+=", "-=", "*=", "/=", "|=", "&=", "^="] {
         if let Some(pos) = find_top_level_operator(s, op) {
-            return last_identifier(&s[..pos]);
+            return lvalue_root(&s[..pos]);
         }
     }
     if let Some(pos) = s.find("++") {
-        return last_identifier(&s[..pos]);
+        return lvalue_root(&s[..pos]);
     }
     if let Some(pos) = s.find("--") {
-        return last_identifier(&s[..pos]);
+        return lvalue_root(&s[..pos]);
     }
     if let Some((lhs, _)) = split_assignment(s) {
         if looks_like_variable_declaration(s) {
             return None;
         }
-        return last_identifier(lhs);
+        return lvalue_root(lhs);
     }
     None
+}
+
+/// The variable an lvalue writes into: `approvedHashes` for `approvedHashes[owner][hash]`, `proposal`
+/// for `proposal.receipts[voter].hasVoted`, `count` for `if (a) count`.
+fn lvalue_root(text: &str) -> Option<String> {
+    let flat = without_brackets(text);
+    let token = flat
+        .trim_end()
+        .rsplit(|ch: char| ch.is_whitespace() || "(){},;!".contains(ch))
+        .next()?;
+    first_identifier(token.split('.').next().unwrap_or(token))
 }
 
 fn split_assignment(statement: &str) -> Option<(&str, &str)> {
@@ -1717,17 +1975,92 @@ fn split_assignment(statement: &str) -> Option<(&str, &str)> {
     Some((&statement[..pos], &statement[pos + 1..]))
 }
 
+/// Flow-insensitive data flow: every variable maps to all expressions assigned to it in the function,
+/// including tuple components (`(r, s, v) = split(sig)`), indexed elements (`r[0] = ..`, recorded on
+/// `r`) and inline-assembly assignments (`r := mload(..)`).
 fn collect_assignments(source: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for statement in split_statements(source) {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let mut record = |name: String, rhs: &str| {
+        let rhs = rhs.trim().trim_end_matches(';').trim();
+        if rhs.is_empty() {
+            return;
+        }
+        out.entry(name)
+            .and_modify(|old| {
+                old.push_str(" , ");
+                old.push_str(rhs);
+            })
+            .or_insert_with(|| rhs.to_string());
+    };
+    let pieces = split_statements(source).into_iter().flat_map(|statement| block_pieces(&statement));
+    for statement in pieces {
+        if statement.contains(":=") {
+            let marks: Vec<usize> = statement.match_indices(":=").map(|(i, _)| i).collect();
+            let mut start = 0;
+            for (k, &pos) in marks.iter().enumerate() {
+                let lhs_name = last_identifier(&statement[start..pos]);
+                let end = marks.get(k + 1).map_or(statement.len(), |&next| {
+                    let before = statement[..next].trim_end();
+                    before.len() - before.bytes().rev().take_while(|b| is_ident_continue(*b)).count()
+                });
+                let end = end.max(pos + 2);
+                if let Some(name) = lhs_name {
+                    record(name, &statement[pos + 2..end]);
+                }
+                start = end;
+            }
+            continue;
+        }
         let Some((lhs, rhs)) = split_assignment(&statement) else {
             continue;
         };
-        if lhs.contains('[') || lhs.contains('(') && lhs.contains(',') {
-            continue;
+        let lhs = lhs.trim();
+        if lhs.starts_with('(') && lhs.contains(',') {
+            for part in split_top_level(lhs.trim_start_matches('(').trim_end_matches(')'), ',') {
+                if let Some(name) = last_identifier(&without_brackets(&part)) {
+                    record(name, rhs);
+                }
+            }
+        } else if let Some(name) = last_identifier(&without_brackets(lhs)) {
+            record(name, rhs);
         }
-        if let Some(name) = last_identifier(lhs) {
-            out.insert(name, rhs.trim().trim_end_matches(';').to_string());
+    }
+    out
+}
+
+/// Splits a statement at block braces outside parentheses, so that `if (c) { x = a; } y = b` or an
+/// inline-assembly block followed by a declaration yields one piece per assignment.
+fn block_pieces(statement: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for ch in statement.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '{' | '}' if depth == 0 => {
+                out.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(ch);
+    }
+    out.push(current);
+    out.retain(|piece| !piece.trim().is_empty());
+    out
+}
+
+/// `r[0]` -> `r`, `bytes32[2] memory r` -> `bytes32 memory r`.
+fn without_brackets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
         }
     }
     out
@@ -2308,6 +2641,56 @@ mod eip1271_verification_tests {
     #[test]
     fn accepts_legacy_interface_with_legacy_magic() {
         assert_eq!(run("../tests/contract-playground/src/signature-patterns/LegacyErc1271Wallet.sol"), 0);
+    }
+
+    #[test]
+    fn follows_library_recovery_call() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/LibraryRecoverWallet.sol"), 0);
+    }
+
+    #[test]
+    fn follows_assembly_split_and_named_return() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/AssemblySplitWallet.sol"), 0);
+    }
+
+    #[test]
+    fn follows_tuple_split_and_zero_address_failure() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/TupleSplitCosignerWallet.sol"), 0);
+    }
+
+    #[test]
+    fn resolves_magic_value_constant() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/SelectorConstantWallet.sol"), 0);
+    }
+
+    #[test]
+    fn accepts_forwarding_to_abstract_variant() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/ForwardingLegacyWallet.sol"), 0);
+    }
+
+    #[test]
+    fn ignores_write_disabled_by_false_argument() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/ApprovedHashWallet.sol"), 0);
+    }
+
+    #[test]
+    fn detects_write_enabled_by_true_argument() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/ApprovedHashWalletConsuming.sol"), 1);
+    }
+
+    #[test]
+    fn detects_named_return_without_signature_check() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/NamedReturnIgnoresSignature.sol"), 1);
+    }
+
+    #[test]
+    fn ignores_local_with_signer_name() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/CreatorSignatureCaller.sol"), 0);
+    }
+
+    #[test]
+    fn ignores_three_argument_ecdsa_helper() {
+        assert_eq!(run("../tests/contract-playground/src/signature-patterns/EcdsaNamedIsValidSignature.sol"), 0);
     }
 }
 
