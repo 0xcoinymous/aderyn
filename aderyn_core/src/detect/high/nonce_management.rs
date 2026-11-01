@@ -2369,10 +2369,10 @@ fn collect_local_names(source: &str, parameters: &[Parameter]) -> BTreeSet<Strin
         if ids.len() < 2 {
             continue;
         }
-        // Value types, and user-defined types in memory or calldata. A storage pointer is not a
-        // local: writes through it change contract state.
-        let memory_local = contains_word(lhs, "memory") || contains_word(lhs, "calldata");
-        if (is_type_keyword(&ids[0]) && !contains_word(lhs, "storage")) || memory_local {
+        // Value-type declarations. A storage pointer is not a local (writes through it change
+        // contract state), and struct-typed memory values are left out: expanding them through their
+        // member assignments can grow without bound.
+        if is_type_keyword(&ids[0]) && !contains_word(lhs, "storage") {
             out.extend(ids.last().cloned());
         }
     }
