@@ -1379,7 +1379,11 @@ fn is_canonical_1901_prefix(expression: &str, model: &FunctionModel) -> bool {
     let resolved = resolve_simple_alias(expression, &model.assignments, 3);
     let c = compact(&resolved).to_ascii_lowercase();
     c.contains("\\x19\\x01")
+        // The two bytes written raw inside the literal, or in single quotes as escapes.
+        || c.contains("\u{19}\u{1}")
+        || c.contains("\\u0019\\u0001")
         || c.contains("hex\"1901\"")
+        || c.contains("hex'1901'")
         || c == "0x1901"
         || c == "uint16(0x1901)"
         || c == "bytes2(0x1901)"
