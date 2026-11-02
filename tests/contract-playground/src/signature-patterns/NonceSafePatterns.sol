@@ -150,3 +150,150 @@ contract CancelOnly {
         filled[msg.sender] += amount;
     }
 }
+
+// Two owners sign one message that holds the nonce, built by nested helpers; the nonce advances once.
+contract TwoOfThreeWallet {
+    uint256 public spendNonce;
+    mapping(address => bool) public owners;
+    function messageToSign(address destination, uint256 value) public view returns (bytes32) {
+        return keccak256(abi.encodePacked(spendNonce, address(this), block.chainid, value, destination));
+    }
+    function messageToRecover(address destination, uint256 value) private view returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageToSign(destination, value)));
+    }
+    function validSignatures(address destination, uint256 value, uint8 v1, bytes32 r1, bytes32 s1, uint8 v2, bytes32 r2, bytes32 s2) private view returns (bool) {
+        bytes32 message = messageToRecover(destination, value);
+        address addr1 = ecrecover(message, v1, r1, s1);
+        address addr2 = ecrecover(message, v2, r2, s2);
+        return addr1 != addr2 && owners[addr1] && owners[addr2];
+    }
+    function spend(address payable destination, uint256 value, uint8 v1, bytes32 r1, bytes32 s1, uint8 v2, bytes32 r2, bytes32 s2) external {
+        require(validSignatures(destination, value, v1, r1, s1, v2, r2, s2), "sigs");
+        spendNonce = spendNonce + 1;
+        destination.transfer(value);
+    }
+}
+
+// The signed nonce must be one past the stored one and is stored.
+contract NextNoncePreSigned {
+    mapping(address => uint256) public nonces;
+    mapping(address => uint256) public balances;
+    function transferPreSigned(address to, uint256 value, uint256 nonce, uint8 v, bytes32 r, bytes32 s) external {
+        bytes32 hash = keccak256(abi.encodePacked(address(this), block.chainid, to, value, nonce));
+        address from = ecrecover(hash, v, r, s);
+        require(from != address(0), "sig");
+        require(nonce == nonces[from] + 1, "nonce");
+        nonces[from] = nonce;
+        balances[from] -= value;
+        balances[to] += value;
+    }
+}
+
+// A signed token id can be minted once; the request is a memory struct.
+contract MintOnceRequest {
+    struct Request { uint256 tokenId; address owner; bytes signature; }
+    address public signerAddress;
+    mapping(uint256 => address) private _owners;
+    function _exists(uint256 tokenId) internal view returns (bool) {
+        return _owners[tokenId] != address(0);
+    }
+    function _mint(address to, uint256 tokenId) internal {
+        _owners[tokenId] = to;
+    }
+    function _safeMint(address to, uint256 tokenId) internal {
+        _mint(to, tokenId);
+    }
+    function recoverSigner(bytes32 hash, bytes memory sig) internal pure returns (address) {
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := mload(add(sig, 32))
+            s := mload(add(sig, 64))
+            v := byte(0, mload(add(sig, 96)))
+        }
+        return ecrecover(hash, v, r, s);
+    }
+    function mintTokens(Request[] calldata requests) external {
+        for (uint256 i = 0; i < requests.length; i++) {
+            Request memory request = requests[i];
+            require(_exists(request.tokenId) == false, "exists");
+            require(request.owner == msg.sender, "owner");
+            bytes32 hash = keccak256(abi.encode(request.tokenId, request.owner, address(this), block.chainid));
+            require(recoverSigner(hash, request.signature) == signerAddress, "sig");
+            _safeMint(msg.sender, request.tokenId);
+        }
+    }
+}
+
+// The hash is wrapped in place before recovery; the signed id is marked used, after an assembly split.
+contract WrappedHashClaim {
+    address public validator;
+    mapping(bytes32 => bool) public processed;
+    mapping(address => uint256) public claimed;
+    function toEthSigned(bytes32 hash) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
+    }
+    function claim(bytes32 id, uint256 amount, bytes memory signature) external {
+        require(signature.length == 65, "length");
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
+        assembly {
+            r := mload(add(signature, 32))
+            s := mload(add(signature, 64))
+            v := byte(0, mload(add(signature, 96)))
+        }
+        bytes32 hash = keccak256(abi.encodePacked(id, msg.sender, amount, address(this), block.chainid));
+        hash = toEthSigned(hash);
+        require(ecrecover(hash, v, r, s) == validator, "sig");
+        _consume(id);
+        claimed[msg.sender] += amount;
+    }
+    function _consume(bytes32 id) internal {
+        if (!processed[id]) {
+            processed[id] = true;
+        } else {
+            revert("done");
+        }
+    }
+}
+
+// A signed delegation that the user can revoke; the signature count in the digest still advances.
+contract RevocableDelegation {
+    mapping(address => uint256) public signatureCount;
+    mapping(address => mapping(address => bool)) public delegated;
+    function addDelegateBySignature(address user, address delegate, uint8 v, bytes32 r, bytes32 s) external {
+        bytes32 digest = keccak256(abi.encode(address(this), block.chainid, user, delegate, signatureCount[user]++));
+        require(ecrecover(digest, v, r, s) == user, "sig");
+        require(!delegated[user][delegate], "delegated");
+        delegated[user][delegate] = true;
+    }
+    function revokeDelegate(address delegate) external {
+        delegated[msg.sender][delegate] = false;
+    }
+}
+
+// A view helper verifies a signed order with its nonce; the state-changing caller consumes it.
+contract ViewOrderCheck {
+    mapping(address => mapping(bytes32 => uint256)) public filled;
+    function available(address maker, uint256 amount, uint256 nonce, uint8 v, bytes32 r, bytes32 s) public view returns (uint256) {
+        bytes32 hash = keccak256(abi.encodePacked(address(this), block.chainid, maker, amount, nonce));
+        if (ecrecover(hash, v, r, s) != maker) {
+            return 0;
+        }
+        return amount - filled[maker][hash];
+    }
+}
+
+// A signed cancellation marks the authorization cancelled with an enum value.
+contract EnumCancellation {
+    enum State { Unused, Used, Canceled }
+    mapping(address => mapping(bytes32 => State)) public states;
+    function cancelAuthorization(address authorizer, bytes32 nonce, uint8 v, bytes32 r, bytes32 s) external {
+        require(states[authorizer][nonce] == State.Unused, "used");
+        bytes32 digest = keccak256(abi.encode(address(this), block.chainid, authorizer, nonce));
+        require(ecrecover(digest, v, r, s) == authorizer, "sig");
+        states[authorizer][nonce] = State.Canceled;
+    }
+}

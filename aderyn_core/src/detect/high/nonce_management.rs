@@ -52,6 +52,8 @@ struct AuthSummary {
     signature_count: usize,
     authenticated_roots: BTreeSet<String>,
     principal_roots: BTreeSet<String>,
+    /// The digest each recovery verifies, in the function's own terms.
+    digests: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +81,25 @@ struct StateSlot {
     field: Option<String>,
 }
 
+/// Whitespace removed, except one space between two words, so that `new bytes(..)` stays two identifiers.
+fn compact_key(text: &str) -> String {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let mut out = String::with_capacity(text.len());
+    let mut gap = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            gap = true;
+            continue;
+        }
+        if gap && word(ch) && out.chars().last().is_some_and(word) {
+            out.push(' ');
+        }
+        gap = false;
+        out.push(ch);
+    }
+    out
+}
+
 impl StateSlot {
     fn normalized(&self, assignments: &HashMap<String, String>) -> Self {
         Self {
@@ -86,7 +107,7 @@ impl StateSlot {
             keys: self
                 .keys
                 .iter()
-                .map(|key| compact(&expand_expression(key, assignments, 4)))
+                .map(|key| compact_key(&expand_expression(key, assignments, 4)))
                 .collect(),
             field: self.field.clone(),
         }
@@ -120,6 +141,9 @@ struct GuardFact {
     bypassable: bool,
     lossy: bool,
     authenticated: bool,
+    /// `require(nonce == nonces[signer] + 1)`: the checked value is one past the stored one, so storing
+    /// it advances the slot.
+    ahead: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +181,8 @@ struct NonceAssessment {
     suspicious: bool,
     rollback_sensitive: bool,
     guarded_slots: Vec<StateSlot>,
+    /// Guarded slots that this function itself consumes (writes after checking, or advances in the digest).
+    consumed_slots: Vec<StateSlot>,
     /// Guarded slots checked to be unused (zero/false) before use: only clearing them revives a signature.
     cleared_slots: Vec<StateSlot>,
 }
@@ -177,7 +203,7 @@ impl IssueDetector for NonceManagementDetector {
                 continue;
             }
             let auth = auth_summaries.get(&model.id).cloned().unwrap_or_default();
-            if !auth.signature_verification {
+            if !auth.signature_verification || !can_change_state(model) || self_call_only(model, &models) {
                 continue;
             }
             assessments.insert(
@@ -512,6 +538,7 @@ fn analyze_direct_auth(
         }
         out.signature_verification = true;
         out.signature_count = out.signature_count.saturating_add(1).min(8);
+        out.digests.insert(compact(&args[0]));
         add_authenticated_expression(&mut out, &args[0], assignments);
         if let Some(principal) = principal_after_call(source, *pos) {
             add_principal_expression(&mut out, &principal, assignments);
@@ -539,6 +566,7 @@ fn analyze_direct_auth(
         };
         out.signature_verification = true;
         out.signature_count = out.signature_count.saturating_add(1).min(8);
+        out.digests.insert(compact(digest));
         add_authenticated_expression(&mut out, digest, assignments);
         if let Some(principal) = principal_after_call(source, *pos) {
             add_principal_expression(&mut out, &principal, assignments);
@@ -631,16 +659,18 @@ fn signatures_per_call(callee: &FunctionModel, recoveries: usize) -> usize {
 }
 
 fn propagate_auth_summaries(models: &BTreeMap<NodeID, FunctionModel>) -> BTreeMap<NodeID, AuthSummary> {
-    let mut summaries: BTreeMap<NodeID, AuthSummary> = models
+    // Each function's own digest includes what the helpers it hashes return (`_messageToRecover(..)`).
+    let direct: BTreeMap<NodeID, AuthSummary> = models
         .iter()
-        .map(|(id, model)| (*id, model.direct_auth.clone()))
+        .map(|(id, model)| (*id, with_digest_helper_returns(model, &model.direct_auth, models)))
         .collect();
+    let mut summaries = direct.clone();
 
     for _ in 0..6 {
         let previous = summaries.clone();
         let mut changed = false;
         for model in models.values() {
-            let mut next = model.direct_auth.clone();
+            let mut next = direct[&model.id].clone();
             let mut previous_verifier_end: Option<usize> = None;
             let mut calls: Vec<&CallSite> = model.calls.iter().collect();
             calls.sort_by_key(|call| call.pos);
@@ -678,6 +708,10 @@ fn propagate_auth_summaries(models: &BTreeMap<NodeID, FunctionModel>) -> BTreeMa
                     callee_model,
                     call,
                     &model.assignments,
+                );
+                let substitutions = parameter_substitutions(callee_model, call);
+                next.digests.extend(
+                    callee.digests.iter().map(|digest| compact(&substitute_identifiers(digest, &substitutions))),
                 );
                 map_auth_roots_through_call(
                     &mut next.principal_roots,
@@ -771,10 +805,47 @@ fn build_state_helper_summaries(
             signature_count: 1,
             authenticated_roots: model.parameters.iter().map(|p| p.name.clone()).collect(),
             principal_roots: BTreeSet::new(),
+            digests: BTreeSet::new(),
         };
         let guards = collect_guards(model, &dummy, &locals, models, &base);
         if let Some(summary) = out.get_mut(&model.id) {
+            // A write in the body of the helper's own `if (!used[k]) { used[k] = true; .. }` runs exactly
+            // when the check passes, like a write after `require`.
+            for write in summary.writes.iter_mut().filter(|write| write.conditional) {
+                if guards.iter().any(|guard| {
+                    guard.slot.same_storage_location(&write.slot)
+                        && write_in_body_of_guard_if(&model.source, guard.pos, write.pos)
+                }) {
+                    write.conditional = false;
+                }
+            }
             summary.guards = guards;
+        }
+    }
+
+    // The plain stores of the helpers a helper calls (`_safeMint` -> `_mint` -> `_owners[id] = to`), in
+    // the helper's own terms. Counter and bitmap updates stay with the helper that checks them.
+    for _ in 0..2 {
+        let snapshot = out.clone();
+        for model in models.values() {
+            let mut nested = Vec::new();
+            for call in model.calls.iter().filter(|call| call.callee != model.id) {
+                let (Some(callee), Some(summary)) = (models.get(&call.callee), snapshot.get(&call.callee)) else {
+                    continue;
+                };
+                for write in summary.writes.iter().filter(|write| write.kind == WriteKind::Assign) {
+                    let mut instantiated = write.clone();
+                    instantiated.slot = instantiate_slot(&write.slot, callee, call, &model.assignments);
+                    instantiated.rhs = instantiate_expression(&write.rhs, callee, call, &model.assignments);
+                    instantiated.pos = call.pos;
+                    instantiated.conditional = write.conditional || is_inside_conditional_block(&model.source, call.pos);
+                    nested.push(instantiated);
+                }
+            }
+            if let Some(summary) = out.get_mut(&model.id) {
+                summary.writes.extend(nested);
+                dedup_writes(&mut summary.writes);
+            }
         }
     }
     out
@@ -786,12 +857,17 @@ fn assess_entry_function(
     models: &BTreeMap<NodeID, FunctionModel>,
     helper_summaries: &BTreeMap<NodeID, StateHelperSummary>,
 ) -> NonceAssessment {
-    let auth = &with_sender_binding(model, &with_digest_helper_returns(model, auth, models));
+    let auth = &with_sender_binding(
+        model,
+        &with_equality_binding(model, &with_digest_helper_returns(model, auth, models)),
+    );
     let locals = collect_local_names(&model.source, &model.parameters);
+    let mut guard_locals = locals.clone();
+    guard_locals.extend(memory_struct_names(&model.source));
     let mut guards = collect_guards(
         model,
         auth,
-        &locals,
+        &guard_locals,
         models,
         helper_summaries,
     );
@@ -812,6 +888,7 @@ fn assess_entry_function(
     let mut effective = 0usize;
     let mut guarded_slots = Vec::new();
     let mut cleared_slots: Vec<StateSlot> = Vec::new();
+    let mut consumed_slots: Vec<StateSlot> = Vec::new();
     let mut candidate_activity = false;
 
     if xor_postcondition
@@ -839,6 +916,9 @@ fn assess_entry_function(
             .any(|write| write.pos >= guard.pos && write.slot.same_storage_location(&guard.slot));
         if guard.authenticated && (written_after || nonce_like && !guard.slot.keys.is_empty()) {
             guarded_slots.push(guard.slot.clone());
+            if written_after {
+                consumed_slots.push(guard.slot.clone());
+            }
             if guard.kind == GuardKind::BoolClear {
                 cleared_slots.push(guard.slot.clone());
             }
@@ -889,6 +969,7 @@ fn assess_entry_function(
         {
             effective += 1;
             candidate_activity = true;
+            consumed_slots.push(slot.clone());
             guarded_slots.push(slot);
         }
     }
@@ -898,7 +979,7 @@ fn assess_entry_function(
     // an explicit guard: a signature over the old value cannot verify again.
     let mut bound_slots: Vec<StateSlot> = Vec::new();
     for write in &writes {
-        if write_is_digest_bound_counter(write, &writes, auth, &model.assignments)
+        if write_is_digest_bound_counter(&model.source, write, &writes, auth, &model.assignments)
             && !bound_slots.iter().any(|slot| slot.same_storage_location(&write.slot))
         {
             bound_slots.push(write.slot.clone());
@@ -907,6 +988,7 @@ fn assess_entry_function(
     if !bound_slots.is_empty() {
         effective += bound_slots.len();
         candidate_activity = true;
+        consumed_slots.extend(bound_slots.iter().cloned());
         guarded_slots.extend(bound_slots);
     }
 
@@ -922,7 +1004,8 @@ fn assess_entry_function(
     // allowing a shared digest registry to protect a single cryptographic authorization.
     let multi_signature_gap = auth.signature_count > 1
         && effective < auth.signature_count
-        && !has_shared_digest_identity_guard(&guards, &writes);
+        && !has_shared_digest_identity_guard(&guards, &writes)
+        && !(effective > 0 && signatures_share_one_digest(auth, &model.assignments));
 
     // A `require(!flag[x])` check is a used-flag guard only when the function then sets that flag;
     // otherwise it is a configuration check such as `!isFrozen[sender]`. Without a nonce-like name, such
@@ -954,7 +1037,13 @@ fn assess_entry_function(
         WriteKind::Increment | WriteKind::AddAssign | WriteKind::OrAssign => true,
         WriteKind::Assign => {
             let rhs = compact(&write.rhs);
-            rhs == "true" || rhs == "1"
+            // `state[id] = AuthorizationState.Canceled`: an enum member is a mark like `true`.
+            let enum_member = rhs.split_once('.').is_some_and(|(ty, member)| {
+                ty.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                    && identifier_sequence(&rhs).len() == 2
+                    && !member.is_empty()
+            });
+            rhs == "true" || rhs == "1" || enum_member
         }
         _ => false,
     };
@@ -996,6 +1085,7 @@ fn assess_entry_function(
             || unchecked_narrow_wrap,
         rollback_sensitive,
         guarded_slots,
+        consumed_slots,
         cleared_slots,
     }
 }
@@ -1003,6 +1093,32 @@ fn assess_entry_function(
 
 /// `require(recipient == msg.sender)` with a signed `recipient`: the caller is the signed account, so
 /// state keyed by `msg.sender` is keyed by a signed value.
+/// A `view` or `pure` function cannot consume a nonce, so its use of one is checked at the caller.
+fn can_change_state(model: &FunctionModel) -> bool {
+    let header = model.source.split('{').next().unwrap_or("");
+    !contains_word(header, "view") && !contains_word(header, "pure") && !contains_word(header, "constant")
+}
+
+/// A function that reverts unless the contract calls itself (`msg.sender == address(this)`), directly or
+/// through a helper, is a step of another signed action and is not reachable with a signature of its own.
+fn self_call_only(model: &FunctionModel, models: &BTreeMap<NodeID, FunctionModel>) -> bool {
+    let requires_self = |source: &str| {
+        let c = compact(source);
+        c.contains("require(msg.sender==address(this)")
+            || c.contains("require(address(this)==msg.sender")
+            || c.contains("if(msg.sender!=address(this)") && super::signature_utils::body_reverts(
+                &c[c.find("if(msg.sender!=address(this)").unwrap_or(0) + "if(msg.sender!=address(this)".len()..],
+            )
+            || c.contains("if(msg.sender!=address(this)||")
+    };
+    requires_self(&model.source)
+        || model
+            .calls
+            .iter()
+            .filter_map(|call| models.get(&call.callee))
+            .any(|callee| requires_self(&callee.source) && !callee.entry_point)
+}
+
 fn with_sender_binding(model: &FunctionModel, auth: &AuthSummary) -> AuthSummary {
     let c = compact(&model.source);
     let bound = identifiers_in_text(&model.source).into_iter().any(|id| {
@@ -1030,17 +1146,68 @@ fn with_digest_helper_returns(
 ) -> AuthSummary {
     let mut out = auth.clone();
     for call in &model.calls {
-        if !auth.authenticated_roots.contains(&call.name) {
-            continue;
+        if auth.authenticated_roots.contains(&call.name) {
+            out.authenticated_roots.extend(helper_return_identifiers(call, models, 3));
         }
-        let Some(callee) = models.get(&call.callee) else {
-            continue;
-        };
-        let substitutions = parameter_substitutions(callee, call);
-        for expression in returned_expressions(&callee.source) {
-            let expanded = expand_expression(&expression, &callee.assignments, 4);
-            let mapped = substitute_identifiers(&expanded, &substitutions);
-            out.authenticated_roots.extend(identifiers_in_text(&mapped));
+    }
+    out
+}
+
+/// The identifiers that `call` returns, in the caller's terms, following the helpers that the returned
+/// expression calls in turn (`_messageToRecover(..)` -> `generateMessageToSign(..)` -> `spendNonce`).
+fn helper_return_identifiers(
+    call: &CallSite,
+    models: &BTreeMap<NodeID, FunctionModel>,
+    depth: usize,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(callee) = models.get(&call.callee) else {
+        return out;
+    };
+    let substitutions = parameter_substitutions(callee, call);
+    let mut returned = BTreeSet::new();
+    for expression in returned_expressions(&callee.source) {
+        let expanded = expand_expression(&expression, &callee.assignments, 4);
+        returned.extend(identifiers_in_text(&expanded));
+        out.extend(identifiers_in_text(&substitute_identifiers(&expanded, &substitutions)));
+    }
+    if depth > 1 {
+        for inner in callee.calls.iter().filter(|inner| returned.contains(&inner.name)) {
+            for id in helper_return_identifiers(inner, models, depth - 1) {
+                match substitutions.get(&id) {
+                    Some(argument) => out.extend(identifiers_in_text(argument)),
+                    None => {
+                        out.insert(id);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `require(hashTransaction(sender, nonce) == hash)` with a signed `hash`: the values hashed on the other
+/// side are signed as well.
+fn with_equality_binding(model: &FunctionModel, auth: &AuthSummary) -> AuthSummary {
+    let mut out = auth.clone();
+    for (condition, _) in extract_conditions(&model.source) {
+        let mut atoms = Vec::new();
+        split_condition_atoms(&condition, false, &mut atoms);
+        for (atom, bypassable) in atoms {
+            let atom = trim_outer_parens(atom.trim());
+            let Some(index) = find_top_level_operator(atom, "==").filter(|_| !bypassable) else {
+                continue;
+            };
+            let (left, right) = (atom[..index].trim(), atom[index + 2..].trim());
+            for (signed, other) in [(left, right), (right, left)] {
+                let signed_local = identifier_sequence(signed).len() == 1
+                    && auth.authenticated_roots.contains(signed)
+                    && !auth.principal_roots.contains(signed);
+                if signed_local && other.contains('(') {
+                    let expanded = expand_expression(other, &model.assignments, 4);
+                    out.authenticated_roots.extend(identifiers_in_text(&expanded));
+                }
+            }
         }
     }
     out
@@ -1075,12 +1242,16 @@ fn compared_with_signed_value(
 }
 
 fn write_is_digest_bound_counter(
+    source: &str,
     write: &WriteFact,
     writes: &[WriteFact],
     auth: &AuthSummary,
     assignments: &HashMap<String, String>,
 ) -> bool {
-    if write.conditional || !counter_write_advances(write, assignments) {
+    // `keccak256(abi.encode(.., nonces[user]++, ..))` advances the counter whenever the digest that is
+    // verified is computed, even inside the branch that verifies it.
+    let in_digest = write.kind == WriteKind::Increment && inside_expression(source, write.pos);
+    if write.conditional && !in_digest || !counter_write_advances(write, assignments) {
         return false;
     }
     let base_signed = auth.authenticated_roots.contains(&write.slot.base)
@@ -1096,6 +1267,16 @@ fn write_is_digest_bound_counter(
             .rev()
             .find(|other| other.slot.same_storage_location(&write.slot))
             .is_some_and(|last| counter_write_advances(last, assignments))
+}
+
+/// The position is inside the arguments of a call rather than a statement of its own.
+fn inside_expression(source: &str, pos: usize) -> bool {
+    let Some(before) = source.get(..pos) else {
+        return false;
+    };
+    let start = before.rfind(|c| matches!(c, ';' | '{' | '}')).map_or(0, |i| i + 1);
+    let segment = &before[start..];
+    segment.matches('(').count() > segment.matches(')').count()
 }
 
 fn counter_write_advances(write: &WriteFact, assignments: &HashMap<String, String>) -> bool {
@@ -1179,6 +1360,7 @@ fn parse_guard_atom(
             pos,
             bypassable,
             lossy: false,
+            ahead: false,
             authenticated,
         });
     }
@@ -1203,6 +1385,7 @@ fn parse_guard_atom(
                     pos,
                     bypassable,
                     lossy: false,
+                    ahead: false,
                     authenticated,
                 });
             }
@@ -1219,6 +1402,7 @@ fn parse_guard_atom(
                     pos,
                     bypassable,
                     lossy: false,
+                    ahead: false,
                     authenticated,
                 });
             }
@@ -1226,12 +1410,27 @@ fn parse_guard_atom(
 
         let left_slot = resolve_slot_expression(left, model, locals, models, helpers);
         let right_slot = resolve_slot_expression(right, model, locals, models, helpers);
+        let mut ahead = false;
         let (slot, candidate, state_on_left) = match (left_slot, right_slot) {
             (Some(slot), None) => (slot, right.to_string(), true),
             (None, Some(slot)) => (slot, left.to_string(), false),
+            (None, None) if operator == "==" => {
+                let resolve = |side: &str| {
+                    strip_increment(side).and_then(|base| resolve_slot_expression(base, model, locals, models, helpers))
+                };
+                ahead = true;
+                match (resolve(left), resolve(right)) {
+                    (Some(slot), None) => (slot, right.to_string(), true),
+                    (None, Some(slot)) => (slot, left.to_string(), false),
+                    _ => continue,
+                }
+            }
             _ => continue,
         };
 
+        if operator == "==" && strip_increment(if state_on_left { left } else { right }).is_some() {
+            ahead = true;
+        }
         let lossy = comparison_is_lossy(left, right);
         let keys_authenticated = slot_keys_authenticated(&slot, auth, &model.assignments);
         let candidate_authenticated = expression_is_authenticated(&candidate, auth, &model.assignments);
@@ -1251,6 +1450,7 @@ fn parse_guard_atom(
                 pos,
                 bypassable,
                 lossy,
+                ahead: false,
                 authenticated: keys_authenticated,
             });
         }
@@ -1272,6 +1472,7 @@ fn parse_guard_atom(
             pos,
             bypassable,
             lossy,
+            ahead,
             authenticated: keys_authenticated && candidate_authenticated,
         });
     }
@@ -1384,7 +1585,8 @@ fn collect_writes_from_statement(
             }
         }
     }
-    let pos = pos + (statement.len() - rest.len());
+    // Offsets found in `statement` are added to `pos`; the write itself starts at `start`.
+    let start = pos + (statement.len() - rest.len());
     // In `if (nonce != nonces[a]++) revert ..;` the only write is in the condition, which always runs.
     let mut head = statement.trim_start();
     while let Some(rest) = head
@@ -1400,7 +1602,7 @@ fn collect_writes_from_statement(
             && matching_delimiter(rest, 0, '(', ')')
                 .is_some_and(|close| super::signature_utils::body_reverts(&rest[close + 1..]))
     });
-    let conditional = is_inside_conditional_block(whole_source, pos)
+    let conditional = is_inside_conditional_block(whole_source, start)
         || (contains_word(statement, "if") && !revert_guard);
 
     if let Some(delete_pos) = find_word_local(statement, "delete") {
@@ -1410,7 +1612,7 @@ fn collect_writes_from_statement(
                 slot,
                 kind: WriteKind::Delete,
                 rhs: String::new(),
-                pos,
+                pos: start,
                 conditional,
             });
         }
@@ -1680,7 +1882,7 @@ fn write_is_effective_for_guard(
             WriteKind::AddAssign => !expression_is_zero(&rhs),
             WriteKind::Assign => {
                 if rhs == candidate || rhs.is_empty() {
-                    return false;
+                    return guard.ahead && !rhs.is_empty();
                 }
                 expression_advances_value(&rhs, &candidate, &guard.slot)
             }
@@ -1756,6 +1958,18 @@ fn write_in_body_of_guard_if(source: &str, guard_pos: usize, write_pos: usize) -
     false
 }
 
+/// `nonces[a].add(1)` or `nonces[a] + 1` -> `nonces[a]`.
+fn strip_increment(expression: &str) -> Option<&str> {
+    let e = expression.trim();
+    let positive = |text: &str| text.trim().parse::<u64>().is_ok_and(|n| n > 0);
+    if let Some(open) = e.rfind(".add(") {
+        let argument = e[open + ".add(".len()..].strip_suffix(')')?;
+        return positive(argument).then(|| &e[..open]);
+    }
+    let plus = e.rfind('+')?;
+    (positive(&e[plus + 1..]) && !e[..plus].trim_end().ends_with('+')).then(|| e[..plus].trim())
+}
+
 fn expression_advances_value(rhs: &str, candidate: &str, slot: &StateSlot) -> bool {
     if rhs.contains("+1") || rhs.contains("+2") || rhs.contains("+3") {
         return rhs.contains(candidate) || rhs.contains(&slot.base);
@@ -1764,6 +1978,22 @@ fn expression_advances_value(rhs: &str, candidate: &str, slot: &StateSlot) -> bo
         return false;
     }
     false
+}
+
+/// Every recovery verifies the same digest (a multisig whose owners sign one transaction hash), so one
+/// consumed nonce in that digest protects all the signatures.
+fn signatures_share_one_digest(auth: &AuthSummary, assignments: &HashMap<String, String>) -> bool {
+    let cores: BTreeSet<BTreeSet<String>> = auth
+        .digests
+        .iter()
+        .map(|digest| {
+            identifiers_in_text(&without_string_literals(&expand_expression(digest, assignments, 5)))
+                .into_iter()
+                .filter(|id| !is_hashing_builtin(id) && !matches!(id.as_str(), "toEthSignedMessageHash" | "ECDSA"))
+                .collect()
+        })
+        .collect();
+    cores.len() == 1
 }
 
 fn has_shared_digest_identity_guard(guards: &[GuardFact], writes: &[WriteFact]) -> bool {
@@ -1898,6 +2128,9 @@ fn has_dangerous_cross_function_mutation(
             .filter(|write| matches!(write.kind, WriteKind::SubAssign | WriteKind::Decrement))
             .map(|write| write.slot)
             .collect();
+    // A replay needs every one-time check of the signature to pass again: reviving one used flag does
+    // not help while a consumed nonce next to it stays consumed.
+    let mut revived = vec![false; assessment.guarded_slots.len()];
     for sibling in models.values() {
         if sibling.id == entry.id || sibling.scope != entry.scope || !sibling.entry_point {
             continue;
@@ -1924,11 +2157,10 @@ fn has_dangerous_cross_function_mutation(
                 return true;
             }
 
-            if !assessment
-                .guarded_slots
-                .iter()
-                .any(|slot| slot.same_storage_family(&write.slot))
-            {
+            let family: Vec<usize> = (0..assessment.guarded_slots.len())
+                .filter(|&i| assessment.guarded_slots[i].same_storage_family(&write.slot))
+                .collect();
+            if family.is_empty() {
                 continue;
             }
             if matches!(write.kind, WriteKind::SubAssign | WriteKind::Decrement)
@@ -1945,11 +2177,26 @@ fn has_dangerous_cross_function_mutation(
                 continue;
             }
             if mutation_is_reversible_or_decreasing(sibling, &write, &sibling_auth) {
-                return true;
+                for i in family {
+                    revived[i] = true;
+                }
             }
         }
     }
-    false
+    // The slots the function consumes are its replay protection; without any, every guarded slot counts.
+    let required: Vec<usize> = (0..assessment.guarded_slots.len())
+        .filter(|&i| {
+            assessment
+                .consumed_slots
+                .iter()
+                .any(|slot| slot.same_storage_location(&assessment.guarded_slots[i]))
+        })
+        .collect();
+    if required.is_empty() {
+        revived.iter().any(|&slot_revived| slot_revived)
+    } else {
+        required.iter().all(|&i| revived[i])
+    }
 }
 
 
@@ -2049,6 +2296,7 @@ fn sibling_has_monotonic_guard_for_write(function: &FunctionModel, write: &Write
         signature_count: 1,
         authenticated_roots: function.parameters.iter().map(|p| p.name.clone()).collect(),
         principal_roots: BTreeSet::new(),
+        digests: BTreeSet::new(),
     };
     let guards = collect_guards(function, &dummy, &locals, &BTreeMap::new(), &BTreeMap::new());
     guards.iter().any(|guard| {
@@ -2374,6 +2622,20 @@ fn collect_local_names(source: &str, parameters: &[Parameter]) -> BTreeSet<Strin
         // member assignments can grow without bound.
         if is_type_keyword(&ids[0]) && !contains_word(lhs, "storage") {
             out.extend(ids.last().cloned());
+        }
+    }
+    out
+}
+
+/// Locals of a struct type in memory or calldata (`Request memory req`): their fields are not contract
+/// state, so a check such as `!_exists(req.tokenId)` is not a check of a state slot named `req`.
+fn memory_struct_names(source: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for piece in split_statements(source).into_iter().flat_map(|statement| super::signature_utils::block_pieces(&statement)) {
+        let declared = piece.split('=').next().unwrap_or_default();
+        let ids = identifier_sequence(declared);
+        if ids.len() == 3 && !is_type_keyword(&ids[0]) && matches!(ids[1].as_str(), "memory" | "calldata") {
+            out.insert(ids[2].clone());
         }
     }
     out
@@ -2767,6 +3029,7 @@ mod nonce_management_tests {
             pos: 1,
             bypassable: false,
             lossy: false,
+            ahead: false,
             authenticated: true,
         };
         let model = FunctionModel {
@@ -2803,6 +3066,7 @@ mod nonce_management_tests {
             pos: 1,
             bypassable: false,
             lossy: false,
+            ahead: false,
             authenticated: true,
         };
         let model = FunctionModel {
