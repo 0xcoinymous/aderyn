@@ -278,14 +278,41 @@ fn analyze_freshness(
     models: &BTreeMap<NodeID, FunctionModel>,
     auth: &AuthSummary,
 ) -> Option<FindingReason> {
-    let predicates = collect_effective_predicates(model.id, models, MAX_CALL_DEPTH);
+    // A signature that must come from the caller (`ecrecover(..) == msg.sender`) delegates nothing: the
+    // caller authorises its own action, such as cancelling its own order.
+    if signer_is_caller(&model.source)
+        || model.calls.iter().any(|call| {
+            models.get(&call.callee).is_some_and(|callee| {
+                callee.sig.params.iter().enumerate().any(|(index, param)| {
+                    call.args.get(index).is_some_and(|arg| canonical_expr(arg) == "msg.sender")
+                        && recovers_into_parameter(&callee.source, &param.name)
+                })
+            })
+        })
+    {
+        return None;
+    }
+    let mut predicates = collect_effective_predicates(model.id, models, MAX_CALL_DEPTH);
     let assignments = collect_effective_assignments(model.id, models, MAX_CALL_DEPTH);
+    // `age = block.timestamp - issuedAt; require(age < MAX)` bounds `issuedAt` like the inline form.
+    let time_locals: HashMap<String, String> = assignments
+        .iter()
+        .filter(|fact| contains_block_timestamp(&fact.rhs) || contains_block_number(&fact.rhs))
+        .filter_map(|fact| simple_identifier(&fact.lhs).map(|name| (name, format!("({})", fact.rhs))))
+        .collect();
+    let expanded: Vec<String> = predicates
+        .iter()
+        .map(|predicate| substitute_identifiers(predicate, &time_locals))
+        .filter(|expanded| !predicates.contains(expanded))
+        .collect();
+    predicates.extend(expanded);
     let candidates = collect_candidates(model, auth, &predicates);
 
     let mut has_authenticated_effective_staleness_limit = false;
     let mut has_unauthenticated_freshness_check = false;
     let mut has_authenticated_ineffective_staleness_signal = false;
     let mut has_any_upper_semantic = false;
+    let mut has_unit_mismatch = false;
 
     for candidate in &candidates {
         if candidate.semantic.is_upper_bound() {
@@ -298,6 +325,9 @@ fn analyze_freshness(
 
         if authenticated && meaningful && candidate.semantic.is_staleness_limiting() {
             has_authenticated_effective_staleness_limit = true;
+        }
+        if authenticated && enforcement.unit_mismatch {
+            has_unit_mismatch = true;
         }
 
         // A runtime freshness predicate that the signer did not authenticate is attacker-adjustable,
@@ -332,16 +362,19 @@ fn analyze_freshness(
         has_authenticated_ineffective_staleness_signal = true;
     }
 
+    // One enforced signed limit bounds how late the authorization can run, whatever other signed
+    // fields (an epoch, a second copy of the deadline) carry, unless the limit compares milliseconds
+    // with seconds.
+    if has_authenticated_effective_staleness_limit && !has_unit_mismatch {
+        return None;
+    }
+
     if has_unauthenticated_freshness_check {
         return Some(FindingReason::FreshnessNotAuthenticated);
     }
 
     if has_authenticated_ineffective_staleness_signal {
         return Some(FindingReason::AuthenticatedFreshnessNotEnforced);
-    }
-
-    if has_authenticated_effective_staleness_limit {
-        return None;
     }
 
     // Intentionally indefinite authorizations can be safe.  Suppress absence findings when the
@@ -372,6 +405,44 @@ fn analyze_freshness(
     }
 
     None
+}
+
+/// `return ecrecover(..) == user` or `require(user == ecrecover(..))` for the parameter `user`.
+fn recovers_into_parameter(source: &str, param: &str) -> bool {
+    let c: String = strip_comments(source).chars().filter(|ch| !ch.is_whitespace()).collect();
+    let mut from = 0;
+    while let Some(rel) = c[from..].find("ecrecover(") {
+        let open = from + rel + "ecrecover".len();
+        let Some(close) = matching_delimiter(&c, open, '(', ')') else {
+            break;
+        };
+        let after = &c[close + 1..];
+        let before = &c[..from + rel];
+        if after.strip_prefix("==").is_some_and(|rest| rest.starts_with(param) && !rest[param.len()..].starts_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_'))
+            || before.ends_with(&format!("{param}=="))
+        {
+            return true;
+        }
+        from = close + 1;
+    }
+    false
+}
+
+fn signer_is_caller(source: &str) -> bool {
+    let c: String = strip_comments(source).chars().filter(|ch| !ch.is_whitespace()).collect();
+    let mut from = 0;
+    while let Some(rel) = c[from..].find("ecrecover(") {
+        let open = from + rel + "ecrecover".len();
+        let Some(close) = matching_delimiter(&c, open, '(', ')') else {
+            break;
+        };
+        let before = &c[..from + rel];
+        if c[close + 1..].starts_with("==msg.sender") || before.ends_with("msg.sender==") {
+            return true;
+        }
+        from = close + 1;
+    }
+    false
 }
 
 fn build_models(context: &WorkspaceContext) -> BTreeMap<NodeID, FunctionModel> {
@@ -796,6 +867,12 @@ fn candidate_is_authenticated(
 
 fn candidate_is_caller_controlled(candidate: &FreshnessCandidate, model: &FunctionModel) -> bool {
     let expanded = expand_expression(&candidate.expr, &model.assignments, 8);
+    // `m_bets[_id].deadline` is a stored value; the caller picks which record, not the deadline in it.
+    let base = identifiers_in_order(expanded.trim_start_matches('(')).into_iter().next().unwrap_or_default();
+    let is_param = |name: &str| model.sig.params.iter().any(|p| p.name == name);
+    if !is_param(&base) && expanded.contains('[') {
+        return false;
+    }
     let deps = identifiers_in_text(&expanded);
     model.sig.params.iter().any(|p| deps.contains(&p.name)) || expanded.contains("msg.data")
 }
@@ -907,6 +984,15 @@ fn evaluate_enforcement(
                 {
                     result.monotonic = true;
                 }
+            }
+            // `require(channel.epoch == epoch)`: a signed round or epoch must be the current one.
+            let is_candidate = |side: &str| canonical_expr(side) == canonical_expr(&candidate.expr);
+            if op == "=="
+                && matches!(candidate.semantic, FreshnessSemantic::Round | FreshnessSemantic::Epoch)
+                && is_candidate(&lhs) != is_candidate(&rhs)
+                && looks_like_state_expression(if is_candidate(&lhs) { &rhs } else { &lhs })
+            {
+                result.monotonic = true;
             }
         }
     }
@@ -1295,12 +1381,25 @@ fn collect_required_predicates(source: &str) -> Vec<String> {
     let source = strip_comments(source);
     let mut out = Vec::new();
 
-    // `Require.that(cond, ..)` and `_require(cond, ..)` wrappers revert like `require`.
-    for name in ["require", "assert", "that", "_require", "requireThat"] {
+    // `Require.that(cond, ..)`, `_require(cond, ..)` and `Errors.require_EXPIRED(cond)` wrappers revert
+    // like `require`.
+    let mut names: BTreeSet<String> = ["require", "assert", "that", "_require", "requireThat"]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    names.extend(
+        identifiers_in_order(&source)
+            .into_iter()
+            .filter(|id| id.starts_with("require_") || id.starts_with("_require_")),
+    );
+    for name in &names {
         for args in find_calls_named(&source, name) {
             if let Some(first) = args.first() {
                 let predicate = strip_outer_parens(first.trim()).to_string();
-                out.push(without_signer_opt_out(&predicate));
+                // Each conjunct of `require(a <= now && now <= b)` is required on its own.
+                for part in split_conjuncts(&predicate) {
+                    out.push(without_signer_opt_out(&part));
+                }
             }
         }
     }
@@ -1334,6 +1433,31 @@ fn collect_required_predicates(source: &str) -> Vec<String> {
     out
 }
 
+/// The top-level `&&` operands of a condition.
+fn split_conjuncts(predicate: &str) -> Vec<String> {
+    let bytes = predicate.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b'&' if depth == 0 && bytes.get(i + 1) == Some(&b'&') => {
+                out.push(strip_outer_parens(predicate[start..i].trim()).to_string());
+                start = i + 2;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(strip_outer_parens(predicate[start..].trim()).to_string());
+    out.retain(|part| !part.is_empty());
+    out
+}
+
 /// `expiry == 0 || now <= expiry` enforces the deadline the signer chose; signing zero is an explicit
 /// choice of no expiry by the signer (DAI-style permits), so the bound is `now <= expiry`.
 fn without_signer_opt_out(predicate: &str) -> String {
@@ -1344,7 +1468,8 @@ fn without_signer_opt_out(predicate: &str) -> String {
     for (zero, other) in [(parts[0], parts[1]), (parts[1], parts[0])] {
         let z = canonical_expr(zero.trim().trim_start_matches('(').trim_end_matches(')'));
         if let Some(name) = z.strip_suffix("==0") {
-            if !name.is_empty() && identifiers_in_text(other).contains(name) {
+            // `sig.deadline == 0 || sig.deadline >= now` as well as a plain `expiry`.
+            if !name.is_empty() && find_word_from(&canonical_expr(other), name, 0).is_some() {
                 return other.trim().to_string();
             }
         }
@@ -1378,9 +1503,17 @@ fn collect_assignment_facts(source: &str) -> Vec<AssignmentFact> {
     let source = strip_comments(source);
     let body = function_body(&source).unwrap_or(source.as_str());
     let mut out = Vec::new();
-    for statement in split_statements(body) {
+    // Statements inside blocks (`unchecked { .. }`, loop and branch bodies) and the statement that
+    // follows a block are assignments as well.
+    let pieces = super::signature_utils::split_statements(body)
+        .into_iter()
+        .flat_map(|statement| super::signature_utils::block_pieces(&statement));
+    for statement in pieces {
         let s = statement.trim();
-        if s.is_empty() || s.starts_with("return ") || s.starts_with("require(") || s.starts_with("if ") {
+        let header = ["if", "for", "while", "else"].iter().any(|kw| {
+            s.strip_prefix(kw).is_some_and(|rest| rest.trim_start().starts_with('(') || rest.starts_with(' '))
+        });
+        if s.is_empty() || header || s.starts_with("return ") || s.starts_with("require(") {
             continue;
         }
         if let Some((lhs, rhs)) = split_assignment(s) {
@@ -1407,7 +1540,7 @@ fn split_assignment(statement: &str) -> Option<(String, String)> {
             '=' if paren >= 0 && bracket >= 0 && brace >= 0 => {
                 let prev = if i > 0 { Some(bytes[i - 1] as char) } else { None };
                 let next = bytes.get(i + 1).map(|b| *b as char);
-                if matches!(prev, Some('=') | Some('!') | Some('<') | Some('>'))
+                if matches!(prev, Some('=') | Some('!') | Some('<') | Some('>') | Some(':'))
                     || next == Some('=')
                 {
                     i += 1;
@@ -1478,10 +1611,11 @@ fn substitute_identifiers(source: &str, substitutions: &HashMap<String, String>)
                 i += 1;
             }
             let word = &source[start..i];
-            if let Some(replacement) = substitutions.get(word) {
-                out.push_str(replacement);
-            } else {
-                out.push_str(word);
+            // A member name (`msg.sender`, `req.deadline`) is not the variable of the same name.
+            let member = out.trim_end().ends_with('.');
+            match substitutions.get(word) {
+                Some(replacement) if !member => out.push_str(replacement),
+                _ => out.push_str(word),
             }
         } else {
             out.push(c);
