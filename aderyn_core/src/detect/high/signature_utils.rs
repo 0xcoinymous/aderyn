@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SrcSpan {
     pub(crate) start: usize,
@@ -226,30 +227,67 @@ pub(crate) fn is_public_or_external(source: &str) -> bool {
 }
 
 pub(crate) fn collect_assignments(source: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for statement in split_statements(source) {
-        let Some(eq) = find_top_level_operator(&statement, "=") else {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let pieces = split_statements(source).into_iter().flat_map(|statement| block_pieces(&statement));
+    for piece in pieces {
+        let Some(eq) = find_top_level_operator(&piece, "=") else {
             continue;
         };
-        if eq > 0
-            && matches!(
-                statement.as_bytes().get(eq - 1).copied(),
-                Some(b'!' | b'<' | b'>' | b'=')
-            )
-        {
+        let bytes = piece.as_bytes();
+        let before = eq.checked_sub(1).map(|i| bytes[i]);
+        // Comparisons and Yul assignments (`r := mload(..)`) are not Solidity assignments.
+        if matches!(before, Some(b'!' | b'<' | b'>' | b'=' | b':')) || bytes.get(eq + 1) == Some(&b'=') {
             continue;
         }
-        let lhs = &statement[..eq];
+        let compound = before.filter(|b| matches!(b, b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b'&' | b'^'));
+        let lhs = &piece[..eq - usize::from(compound.is_some())];
         if lhs.contains('[') || lhs.trim_start().starts_with('(') {
             continue;
         }
-        let rhs = statement[eq + 1..].trim().trim_end_matches(';').trim();
-        if let Some(name) = last_identifier(lhs) {
-            out.insert(name, rhs.to_string());
+        let Some(name) = last_identifier(lhs) else {
+            continue;
+        };
+        let mut rhs = piece[eq + 1..].trim().trim_end_matches(';').trim().to_string();
+        if let Some(op) = compound {
+            rhs = format!("{name} {} ({rhs})", op as char);
         }
+        // `h = h.toEthSignedMessageHash()` refines the earlier value of `h` instead of replacing it; without
+        // an earlier value (`v` set in assembly, then `v += 27`) the variable is left unexpanded.
+        if references_variable(&rhs, &name) {
+            match out.get(&name) {
+                Some(previous) => {
+                    let composed = substitute_variables(
+                        &rhs,
+                        &HashMap::from([(name.clone(), format!("({previous})"))]),
+                    );
+                    if composed.len() > MAX_COMPOSED_LEN || references_variable(&composed, &name) {
+                        out.remove(&name);
+                        continue;
+                    }
+                    rhs = composed;
+                }
+                None => continue,
+            }
+        }
+        out.insert(name, rhs);
     }
     out
 }
+
+/// `name` occurs in `text` as a variable, not as a member name (`nonce.current()` does not use `current`).
+fn references_variable(text: &str, name: &str) -> bool {
+    let mut from = 0;
+    while let Some(pos) = find_word_from(text, name, from) {
+        if !text[..pos].trim_end().ends_with('.') {
+            return true;
+        }
+        from = pos + name.len();
+    }
+    false
+}
+
+/// Longest value that a reassignment `x = f(x)` composes with the earlier value of `x`.
+const MAX_COMPOSED_LEN: usize = 1 << 14;
 
 /// Longest expansion of one variable that is substituted; a longer one leaves the variable as it is.
 /// Chains of assignments that use the previous variable several times grow exponentially otherwise.
@@ -297,6 +335,15 @@ pub(crate) fn substitute_identifiers(
     text: &str,
     substitutions: &HashMap<String, String>,
 ) -> String {
+    substitute(text, substitutions, false)
+}
+
+/// Substitutes variables, leaving member names after a `.` as they are.
+pub(crate) fn substitute_variables(text: &str, substitutions: &HashMap<String, String>) -> String {
+    substitute(text, substitutions, true)
+}
+
+fn substitute(text: &str, substitutions: &HashMap<String, String>, variables_only: bool) -> String {
     if substitutions.is_empty() {
         return text.to_string();
     }
@@ -311,10 +358,12 @@ pub(crate) fn substitute_identifiers(
                 i += 1;
             }
             let ident = &text[start..i];
-            if let Some(replacement) = substitutions.get(ident) {
-                out.push_str(replacement);
-            } else {
-                out.push_str(ident);
+            // With `variables_only`, a member name (`msg.sender`, `order.nonce`) is not the variable of
+            // the same name.
+            let member = variables_only && out.trim_end().ends_with('.');
+            match substitutions.get(ident) {
+                Some(replacement) if !member => out.push_str(replacement),
+                _ => out.push_str(ident),
             }
         } else {
             out.push(bytes[i] as char);
